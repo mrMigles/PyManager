@@ -50,7 +50,7 @@ jobs:
         with:
           url: ${{ secrets.PORTAINER_URL }}
           token: ${{ secrets.PORTAINER_TOKEN }}
-          name: ${{ vars.STACK_NAME }}
+          name: ${{ secrets.STACK_NAME }}
           file: docker-compose.yml
           type: file
           pull: true
