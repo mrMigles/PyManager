@@ -7,7 +7,7 @@ ENV PYTHONUNBUFFERED=1 \
 
 COPY main.py .
 
-RUN python -m pip install --no-cache-dir python-telegram-bot==21.6
+RUN python -m pip install --no-cache-dir python-telegram-bot==21.6 psutil
 
 VOLUME ["/data"]
 
