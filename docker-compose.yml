@@ -5,6 +5,9 @@ services:
     image: ghcr.io/mrmigles/py-manager:latest
     container_name: script-bot
     restart: unless-stopped
+    pids_limit: 512
+    security_opt:
+      - seccomp=unconfined
 
     environment:
       # required

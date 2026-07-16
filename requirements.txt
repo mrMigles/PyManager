@@ -1,0 +1,9 @@
+# Runtime dependencies for the bot itself.
+#
+# These are installed system-wide in the image: every per-app venv is created
+# with --system-site-packages, so this is the one set of packages shared
+# across all apps (see README "Isolation model"). py7zr is only used by the
+# manager itself to extract uploaded .7z archives.
+python-telegram-bot==21.6
+psutil
+py7zr

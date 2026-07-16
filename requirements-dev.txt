@@ -1,0 +1,6 @@
+# Runtime deps (see requirements.txt) plus the test tooling itself.
+# Not used at runtime in the container image.
+-r requirements.txt
+
+pytest>=8.0
+pytest-asyncio>=0.23

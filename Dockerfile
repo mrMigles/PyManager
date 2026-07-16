@@ -5,9 +5,17 @@ WORKDIR /app
 ENV PYTHONUNBUFFERED=1 \
     DATA_DIR=/data
 
-COPY main.py .
+# git is needed to clone/sync GitHub-based apps
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends git \
+    && rm -rf /var/lib/apt/lists/*
 
-RUN python -m pip install --no-cache-dir python-telegram-bot==21.6 psutil
+# python-telegram-bot & psutil are installed system-wide: every per-app venv is
+# created with --system-site-packages, so this is the one thing shared across apps.
+COPY requirements.txt .
+RUN python -m pip install --no-cache-dir -r requirements.txt
+
+COPY main.py .
 
 VOLUME ["/data"]
 
