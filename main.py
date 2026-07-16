@@ -5,7 +5,11 @@ Telegram Script Manager Bot
 
 Features:
 - Manage Python scripts: upload/edit/run/stop/logs/env/autostart
-- Script versioning: keep last 10 versions with timestamps + rollback menu
+- Apps from archives (.zip/.tar.gz/.tgz/.tar/.7z): auto-extract, detect requirements.txt,
+  detect entry point (main.py / single file / ask), each app gets its own isolated venv
+- Apps from GitHub repos (optionally a subfolder): clone, detect same as above, plus a
+  Sync button to re-pull latest code and offer to install any new dependencies
+- Script versioning: keep last 10 versions with timestamps + rollback menu (also for apps)
 - Better /list and /menu with emojis and extra info
 - /monitoring: CPU/MEM (and some optional stats) for running scripts (uses psutil if installed)
 - pip installs are stored in requirements.txt and installed on manager startup
@@ -24,8 +28,10 @@ import shlex
 import asyncio
 import logging
 import shutil
+import tarfile
+import zipfile
 from pathlib import Path
-from typing import Dict, Any, Optional, List
+from typing import Dict, Any, Optional, List, Tuple
 from collections import deque
 from datetime import datetime
 
@@ -54,10 +60,38 @@ VERSIONS_DIR = DATA_DIR / "versions"
 META_FILE = DATA_DIR / "meta.json"
 REQUIREMENTS_FILE = DATA_DIR / "requirements.txt"
 
+# New: multi-file apps (from archives or GitHub repos), each with its own isolated venv
+APPS_DIR = DATA_DIR / "apps"
+APP_VERSIONS_DIR = DATA_DIR / "app_versions"
+VENVS_DIR = DATA_DIR / "venvs"
+GITREPOS_DIR = DATA_DIR / "gitrepos"
+TMP_DIR = DATA_DIR / "tmp"
+
 DATA_DIR.mkdir(parents=True, exist_ok=True)
 SCRIPTS_DIR.mkdir(parents=True, exist_ok=True)
 LOGS_DIR.mkdir(parents=True, exist_ok=True)
 VERSIONS_DIR.mkdir(parents=True, exist_ok=True)
+APPS_DIR.mkdir(parents=True, exist_ok=True)
+APP_VERSIONS_DIR.mkdir(parents=True, exist_ok=True)
+VENVS_DIR.mkdir(parents=True, exist_ok=True)
+GITREPOS_DIR.mkdir(parents=True, exist_ok=True)
+TMP_DIR.mkdir(parents=True, exist_ok=True)
+
+# Directories to ignore when scanning a project for .py files / requirements.txt
+IGNORED_PROJECT_DIRS = {
+    ".git", "__pycache__", "venv", ".venv", "env", ".env", "node_modules",
+    ".idea", ".vscode", ".mypy_cache", ".pytest_cache", "site-packages",
+    "dist", "build", ".github", "__MACOSX",
+}
+
+ARCHIVE_EXTENSIONS = (".tar.gz", ".tgz", ".tar", ".zip", ".7z")
+
+GITHUB_TREE_URL_RE = re.compile(
+    r'^https?://github\.com/(?P<owner>[^/\s]+)/(?P<repo>[^/\s]+?)(?:\.git)?/tree/(?P<branch>[^/\s]+)/(?P<path>[^\s]+?)/?$'
+)
+GITHUB_REPO_URL_RE = re.compile(
+    r'^https?://github\.com/(?P<owner>[^/\s]+)/(?P<repo>[^/\s]+?)(?:\.git)?/?$'
+)
 
 # Logging
 bot_log_path = DATA_DIR / "bot.log"
@@ -133,6 +167,226 @@ def write_text_file_atomic(path: Path, content: str) -> None:
   tmp.replace(path)
 
 
+def sanitize_id(name: str) -> str:
+  # Used only for NEW app ids (archives / github repos) - kept separate from the
+  # legacy script id derivation to not change behavior of existing scripts (BWC).
+  name = (name or "").strip().replace(" ", "_")
+  name = re.sub(r"[^A-Za-z0-9_.-]", "_", name)
+  name = name.strip("_.- ")
+  return name or "app"
+
+
+def venv_python_path(venv_dir: Path) -> Path:
+  if os.name == "nt":
+    return venv_dir / "Scripts" / "python.exe"
+  return venv_dir / "bin" / "python"
+
+
+async def create_venv(venv_dir: Path) -> Tuple[bool, str]:
+  py = venv_python_path(venv_dir)
+  if py.exists():
+    return True, "venv already exists"
+  venv_dir.parent.mkdir(parents=True, exist_ok=True)
+  logger.info("Creating venv at %s", venv_dir)
+  proc = await asyncio.create_subprocess_exec(
+      sys.executable,
+      "-m",
+      "venv",
+      "--system-site-packages",
+      str(venv_dir),
+      stdout=asyncio.subprocess.PIPE,
+      stderr=asyncio.subprocess.STDOUT,
+  )
+  out, _ = await proc.communicate()
+  text = out.decode("utf-8", errors="replace")
+  ok = proc.returncode == 0 and py.exists()
+  if not ok:
+    logger.error("venv creation failed for %s: %s", venv_dir, text)
+  return ok, text
+
+
+def strip_archive_ext(filename: str) -> str:
+  lower = filename.lower()
+  for ext in ARCHIVE_EXTENSIONS:
+    if lower.endswith(ext):
+      return filename[: -len(ext)]
+  return Path(filename).stem
+
+
+def archive_ext_of(filename: str) -> str:
+  # Path(filename).suffix would truncate ".tar.gz" down to ".gz" - keep the full
+  # multi-part extension so downstream extraction picks the correct code path.
+  lower = filename.lower()
+  for ext in ARCHIVE_EXTENSIONS:
+    if lower.endswith(ext):
+      return filename[len(filename) - len(ext):]
+  return Path(filename).suffix
+
+
+def _validate_zip_members(zf: "zipfile.ZipFile", dest_dir: Path) -> None:
+  dest_resolved = dest_dir.resolve()
+  for name in zf.namelist():
+    target = (dest_dir / name).resolve()
+    if not str(target).startswith(str(dest_resolved)):
+      raise ValueError(f"Unsafe path in archive: {name}")
+
+
+def _validate_tar_members(tf: "tarfile.TarFile", dest_dir: Path) -> None:
+  dest_resolved = dest_dir.resolve()
+  for member in tf.getmembers():
+    target = (dest_dir / member.name).resolve()
+    if not str(target).startswith(str(dest_resolved)):
+      raise ValueError(f"Unsafe path in archive: {member.name}")
+
+
+def extract_archive(archive_path: Path, dest_dir: Path) -> None:
+  dest_dir.mkdir(parents=True, exist_ok=True)
+  lower = str(archive_path).lower()
+  if lower.endswith(".zip"):
+    with zipfile.ZipFile(archive_path) as zf:
+      _validate_zip_members(zf, dest_dir)
+      zf.extractall(dest_dir)
+  elif lower.endswith(".tar.gz") or lower.endswith(".tgz"):
+    with tarfile.open(archive_path, "r:gz") as tf:
+      _validate_tar_members(tf, dest_dir)
+      tf.extractall(dest_dir, filter="data")
+  elif lower.endswith(".tar"):
+    with tarfile.open(archive_path, "r:") as tf:
+      _validate_tar_members(tf, dest_dir)
+      tf.extractall(dest_dir, filter="data")
+  elif lower.endswith(".7z"):
+    try:
+      import py7zr  # type: ignore
+    except ImportError as e:
+      raise RuntimeError("py7zr is not installed on the manager, cannot extract .7z archives") from e
+    with py7zr.SevenZipFile(archive_path, mode="r") as zf:
+      names = zf.getnames()
+      dest_resolved = dest_dir.resolve()
+      for name in names:
+        target = (dest_dir / name).resolve()
+        if not str(target).startswith(str(dest_resolved)):
+          raise ValueError(f"Unsafe path in archive: {name}")
+      zf.extractall(path=dest_dir)
+  else:
+    raise ValueError(f"Unsupported archive type: {archive_path.suffix}")
+
+
+def find_extraction_root(staging: Path) -> Path:
+  # Many archives (e.g. GitHub zip exports) wrap everything in one top-level folder.
+  entries = [p for p in staging.iterdir() if p.name not in IGNORED_PROJECT_DIRS]
+  if len(entries) == 1 and entries[0].is_dir():
+    return entries[0]
+  return staging
+
+
+def discover_python_files(root: Path) -> List[str]:
+  result: List[str] = []
+  root = root.resolve()
+  for dirpath, dirnames, filenames in os.walk(root):
+    dirnames[:] = [d for d in dirnames if d not in IGNORED_PROJECT_DIRS and not d.startswith(".")]
+    for fn in filenames:
+      if fn.lower().endswith(".py"):
+        rel = str(Path(dirpath, fn).relative_to(root)).replace("\\", "/")
+        result.append(rel)
+  result.sort()
+  return result
+
+
+def find_requirements_file(root: Path) -> Optional[Path]:
+  direct = root / "requirements.txt"
+  if direct.exists():
+    return direct
+  for dirpath, dirnames, filenames in os.walk(root):
+    dirnames[:] = [d for d in dirnames if d not in IGNORED_PROJECT_DIRS and not d.startswith(".")]
+    for fn in filenames:
+      if fn.lower() == "requirements.txt":
+        return Path(dirpath) / fn
+  return None
+
+
+def find_requirements_pkgs(root: Path) -> List[str]:
+  req = find_requirements_file(root)
+  if not req:
+    return []
+  try:
+    return [
+        line.strip()
+        for line in read_text_file(req).splitlines()
+        if line.strip() and not line.strip().startswith("#")
+    ]
+  except Exception:
+    return []
+
+
+def pick_entry_from_candidates(py_files: List[str]) -> Tuple[Optional[str], bool]:
+  """Returns (entry_or_None, ambiguous)."""
+  mains = [f for f in py_files if Path(f).name.lower() == "main.py"]
+  if mains:
+    mains.sort(key=lambda p: p.count("/"))
+    return mains[0], False
+  if len(py_files) == 1:
+    return py_files[0], False
+  if len(py_files) == 0:
+    return None, False
+  return None, True
+
+
+def parse_github_url(text: str) -> Optional[Dict[str, Any]]:
+  url = (text or "").strip()
+  m = GITHUB_TREE_URL_RE.match(url)
+  if m:
+    owner, repo, branch, path = m.group("owner"), m.group("repo"), m.group("branch"), m.group("path")
+    folder = path.rstrip("/").split("/")[-1]
+    app_id = sanitize_id(f"{repo}-{folder}")
+    return {"owner": owner, "repo": repo, "branch": branch, "path": path, "app_id": app_id}
+  m = GITHUB_REPO_URL_RE.match(url)
+  if m:
+    owner, repo = m.group("owner"), m.group("repo")
+    app_id = sanitize_id(repo)
+    return {"owner": owner, "repo": repo, "branch": None, "path": None, "app_id": app_id}
+  return None
+
+
+async def _run_cmd(*args: str) -> Tuple[bool, str]:
+  proc = await asyncio.create_subprocess_exec(
+      *args,
+      stdout=asyncio.subprocess.PIPE,
+      stderr=asyncio.subprocess.STDOUT,
+  )
+  out, _ = await proc.communicate()
+  text = out.decode("utf-8", errors="replace")
+  return proc.returncode == 0, text
+
+
+async def git_clone_or_pull(repo_url: str, branch: Optional[str], dest: Path) -> Tuple[bool, str]:
+  if (dest / ".git").exists():
+    ok, out1 = await _run_cmd("git", "-C", str(dest), "fetch", "--depth", "1", "origin", branch or "HEAD")
+    if not ok:
+      return False, out1
+    target = f"origin/{branch}" if branch else "FETCH_HEAD"
+    ok, out2 = await _run_cmd("git", "-C", str(dest), "reset", "--hard", target)
+    return ok, out1 + "\n" + out2
+  # Clean up any partial/failed previous clone attempt so `git clone` doesn't
+  # refuse to write into a non-empty directory.
+  if dest.exists():
+    shutil.rmtree(dest, ignore_errors=True)
+  dest.parent.mkdir(parents=True, exist_ok=True)
+  cmd = ["git", "clone", "--depth", "1"]
+  if branch:
+    cmd += ["--branch", branch]
+  cmd += [repo_url, str(dest)]
+  return await _run_cmd(*cmd)
+
+
+async def git_current_branch(repo_dir: Path) -> str:
+  ok, out = await _run_cmd("git", "-C", str(repo_dir), "rev-parse", "--abbrev-ref", "HEAD")
+  if ok:
+    branch = out.strip()
+    if branch and branch != "HEAD":
+      return branch
+  return "main"
+
+
 class ScriptManager:
   def __init__(self) -> None:
     self.meta: Dict[str, Any] = {"global_env": {}, "scripts": {}}
@@ -149,6 +403,7 @@ class ScriptManager:
     self.pending_edit: Dict[int, str] = {}
     self.pending_env_value: Dict[int, Dict[str, str]] = {}
     self.pending_pip: Dict[int, Optional[str]] = {}
+    self.pending_entry_choice: Dict[str, List[str]] = {}  # app_id -> candidate py files
 
     self.load_meta()
 
@@ -173,6 +428,7 @@ class ScriptManager:
       s.setdefault("autostart", False)
       s.setdefault("versions", [])  # list[{ts, file}]
       s.setdefault("updated_at", None)
+      s.setdefault("type", "script")  # "script" (legacy .py) | "project" (archive) | "git"
 
     self.save_meta()
 
@@ -204,31 +460,33 @@ class ScriptManager:
 
   # requirements.txt handling
 
-  def _read_requirements_lines(self) -> List[str]:
-    if not REQUIREMENTS_FILE.exists():
+  def _read_requirements_lines(self, path: Optional[Path] = None) -> List[str]:
+    p = path or REQUIREMENTS_FILE
+    if not p.exists():
       return []
     lines = []
-    for raw in read_text_file(REQUIREMENTS_FILE).splitlines():
+    for raw in read_text_file(p).splitlines():
       line = raw.strip()
       if not line or line.startswith("#"):
         continue
       lines.append(line)
     return lines
 
-  def add_requirements(self, pkgs: List[str]) -> bool:
+  def add_requirements(self, pkgs: List[str], path: Optional[Path] = None) -> bool:
     if not pkgs:
       return False
-    existing = self._read_requirements_lines()
+    p = path or REQUIREMENTS_FILE
+    existing = self._read_requirements_lines(p)
     existing_set = set(existing)
     changed = False
-    for p in pkgs:
-      if p and p not in existing_set:
-        existing.append(p)
-        existing_set.add(p)
+    for pkg in pkgs:
+      if pkg and pkg not in existing_set:
+        existing.append(pkg)
+        existing_set.add(pkg)
         changed = True
     if changed:
       content = "\n".join(existing) + "\n"
-      write_text_file_atomic(REQUIREMENTS_FILE, content)
+      write_text_file_atomic(p, content)
     return changed
 
   async def ensure_requirements_installed(self) -> None:
@@ -266,6 +524,43 @@ class ScriptManager:
     text = safe_trim_text(text, 3500)
     logger.info("Startup pip install exit=%s, output:\n%s", proc.returncode, text)
 
+  async def ensure_app_environments(self) -> None:
+    # Make sure every project/git app has a working venv + its deps installed,
+    # e.g. after a fresh volume or container rebuild.
+    scripts = self.meta.get("scripts", {})
+    for sid, s in list(scripts.items()):
+      if not isinstance(s, dict) or s.get("type") not in ("project", "git"):
+        continue
+      root = Path(s.get("root_dir") or "")
+      if not root.exists():
+        logger.warning("App %s root_dir missing (%s), skipping env setup", sid, root)
+        continue
+      venv_dir = Path(s.get("venv_dir") or self.app_venv_dir(sid))
+      ok, out = await create_venv(venv_dir)
+      if not ok:
+        logger.error("Failed to prepare venv for app %s: %s", sid, safe_trim_text(out, 1000))
+        continue
+      req_file = root / "requirements.txt"
+      if req_file.exists():
+        python_exe = venv_python_path(venv_dir)
+        proc = await asyncio.create_subprocess_exec(
+            str(python_exe),
+            "-m",
+            "pip",
+            "install",
+            "-r",
+            str(req_file),
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.STDOUT,
+        )
+        out2, _ = await proc.communicate()
+        logger.info(
+            "Startup pip install for app %s exit=%s:\n%s",
+            sid,
+            proc.returncode,
+            safe_trim_text(out2.decode("utf-8", errors="replace"), 2000),
+        )
+
   # scripts
 
   def _ensure_script_meta(self, script_id: str, file_path: str) -> None:
@@ -277,12 +572,20 @@ class ScriptManager:
     script.setdefault("autostart", False)
     script.setdefault("versions", [])
     script.setdefault("updated_at", None)
+    script["type"] = "script"
     script["file"] = file_path
     scripts[script_id] = script
     self.save_meta()
 
   def get_script(self, script_id: str) -> Optional[Dict[str, Any]]:
     return self.meta.get("scripts", {}).get(script_id)
+
+  def get_type(self, script_id: str) -> str:
+    s = self.get_script(script_id)
+    return (s or {}).get("type", "script")
+
+  def is_project_type(self, script_id: str) -> bool:
+    return self.get_type(script_id) in ("project", "git")
 
   def script_file_path(self, script_id: str) -> Path:
     return SCRIPTS_DIR / f"{script_id}.py"
@@ -291,6 +594,140 @@ class ScriptManager:
     d = VERSIONS_DIR / script_id
     d.mkdir(parents=True, exist_ok=True)
     return d
+
+  # apps (archives / github repos) - each gets its own root dir + isolated venv
+
+  def app_root_dir(self, script_id: str) -> Path:
+    return APPS_DIR / script_id
+
+  def app_venv_dir(self, script_id: str) -> Path:
+    return VENVS_DIR / script_id
+
+  def app_venv_python(self, script_id: str) -> Path:
+    return venv_python_path(self.app_venv_dir(script_id))
+
+  def app_versions_dir_for(self, script_id: str) -> Path:
+    d = APP_VERSIONS_DIR / script_id
+    d.mkdir(parents=True, exist_ok=True)
+    return d
+
+  def app_requirements_file(self, script_id: str) -> Optional[Path]:
+    script = self.get_script(script_id)
+    if not script:
+      return None
+    root = Path(script.get("root_dir") or "")
+    if not root.exists():
+      return None
+    return root / "requirements.txt"
+
+  def _ensure_app_meta(
+      self,
+      script_id: str,
+      app_type: str,
+      root_dir: Path,
+      entry: Optional[str],
+      venv_dir: Path,
+      git_info: Optional[Dict[str, Any]] = None,
+  ) -> None:
+    scripts = self.meta.setdefault("scripts", {})
+    script = scripts.get(script_id, {})
+    if not isinstance(script, dict):
+      script = {}
+    script.setdefault("env", {})
+    script.setdefault("autostart", False)
+    script.setdefault("versions", [])
+    script.setdefault("updated_at", None)
+    script["type"] = app_type
+    script["root_dir"] = str(root_dir)
+    script["entry"] = entry
+    script["venv_dir"] = str(venv_dir)
+    if git_info is not None:
+      script["git"] = git_info
+    scripts[script_id] = script
+    self.save_meta()
+
+  async def setup_project_app(
+      self,
+      script_id: str,
+      extracted_root: Path,
+      app_type: str,
+      git_info: Optional[Dict[str, Any]] = None,
+  ) -> Dict[str, Any]:
+    """Moves extracted_root -> APPS_DIR/script_id (snapshotting previous content if any),
+    prepares an isolated venv, and detects the entry point + requirements."""
+    dest_root = self.app_root_dir(script_id)
+
+    existing = self.get_script(script_id)
+    if existing:
+      if existing.get("type", "script") == "script":
+        self.snapshot_current_version(script_id)
+      else:
+        self.snapshot_current_app_version(script_id)
+
+    if dest_root.exists():
+      shutil.rmtree(dest_root, ignore_errors=True)
+    dest_root.parent.mkdir(parents=True, exist_ok=True)
+    shutil.move(str(extracted_root), str(dest_root))
+
+    py_files = discover_python_files(dest_root)
+    entry, ambiguous = pick_entry_from_candidates(py_files)
+
+    venv_dir = self.app_venv_dir(script_id)
+    venv_ok, venv_out = await create_venv(venv_dir)
+
+    self._ensure_app_meta(script_id, app_type, dest_root, entry, venv_dir, git_info)
+    script = self.get_script(script_id)
+    if script:
+      script["updated_at"] = now_ts_str()
+      self.save_meta()
+
+    logger.info("App %s set up (type=%s, entry=%s, ambiguous=%s)", script_id, app_type, entry, ambiguous)
+
+    result: Dict[str, Any] = {
+        "app_id": script_id,
+        "venv_ok": venv_ok,
+        "venv_out": venv_out,
+        "requirements_pkgs": find_requirements_pkgs(dest_root),
+        "py_files": py_files,
+    }
+    if ambiguous:
+      self.pending_entry_choice[script_id] = py_files
+      result["status"] = "ambiguous"
+      result["candidates"] = py_files
+    else:
+      result["status"] = "ready"
+      result["entry"] = entry
+    return result
+
+  async def install_app_requirements(self, script_id: str) -> str:
+    script = self.get_script(script_id)
+    if not script:
+      return "❌ App not found."
+    root = Path(script.get("root_dir") or "")
+    req_file = root / "requirements.txt"
+    if not req_file.exists():
+      return "🟡 No requirements.txt found."
+
+    venv_dir = Path(script.get("venv_dir") or self.app_venv_dir(script_id))
+    python_exe = venv_python_path(venv_dir)
+    if not python_exe.exists():
+      ok, out = await create_venv(venv_dir)
+      if not ok:
+        return "❌ Failed to prepare venv:\n" + safe_trim_text(out, 1500)
+
+    proc = await asyncio.create_subprocess_exec(
+        str(python_exe),
+        "-m",
+        "pip",
+        "install",
+        "-r",
+        str(req_file),
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.STDOUT,
+    )
+    out, _ = await proc.communicate()
+    text = safe_trim_text(out.decode("utf-8", errors="replace"), 3200)
+    return f"📥 pip install -r requirements.txt (exit={proc.returncode})\n{text}"
 
   def _push_version(self, script_id: str, version_file: Path, ts: str) -> None:
     script = self.get_script(script_id)
@@ -315,6 +752,19 @@ class ScriptManager:
 
     self.save_meta()
 
+  @staticmethod
+  def _unique_version_path(vdir: Path, script_id: str, ts: str, ext: str) -> Path:
+    # now_ts_str() has 1-second resolution, so two snapshots taken in quick
+    # succession (rapid edits, or a snapshot-before-rollback right after a
+    # snapshot-on-upload) can land on the same name. Never reuse a version
+    # file name - that would silently overwrite a still-referenced version.
+    candidate = vdir / f"{script_id}_{ts}{ext}"
+    n = 1
+    while candidate.exists():
+      candidate = vdir / f"{script_id}_{ts}_{n}{ext}"
+      n += 1
+    return candidate
+
   def snapshot_current_version(self, script_id: str) -> None:
     script = self.get_script(script_id)
     if not script:
@@ -328,13 +778,32 @@ class ScriptManager:
 
     ts = now_ts_str()
     vdir = self.versions_dir_for(script_id)
-    version_file = vdir / f"{script_id}_{ts}.py"
+    version_file = self._unique_version_path(vdir, script_id, ts, ".py")
     try:
       shutil.copy2(cur_path, version_file)
       self._push_version(script_id, version_file, ts)
       logger.info("Snapshot version for %s -> %s", script_id, version_file.name)
     except Exception:
       logger.exception("Failed to snapshot version for %s", script_id)
+
+  def snapshot_current_app_version(self, script_id: str) -> None:
+    script = self.get_script(script_id)
+    if not script:
+      return
+    root = Path(script.get("root_dir") or "")
+    if not root.exists():
+      return
+
+    ts = now_ts_str()
+    vdir = self.app_versions_dir_for(script_id)
+    version_file = self._unique_version_path(vdir, script_id, ts, ".tar.gz")
+    try:
+      with tarfile.open(version_file, "w:gz") as tf:
+        tf.add(root, arcname=script_id)
+      self._push_version(script_id, version_file, ts)
+      logger.info("Snapshot app version for %s -> %s", script_id, version_file.name)
+    except Exception:
+      logger.exception("Failed to snapshot app version for %s", script_id)
 
   def upsert_script_from_text(self, name: str, content: str) -> str:
     script_id = name.strip().replace(" ", "_")
@@ -455,9 +924,32 @@ class ScriptManager:
     if proc and proc.returncode is None:
       return "🟡 Already running."
 
-    file_path = script.get("file")
-    if not file_path or not Path(file_path).exists():
-      return "❌ Script file not found."
+    app_type = script.get("type", "script")
+    if app_type == "script":
+      file_path = script.get("file")
+      if not file_path or not Path(file_path).exists():
+        return "❌ Script file not found."
+      python_exe = sys.executable
+      cwd = str(SCRIPTS_DIR)
+      run_target = file_path
+    else:
+      root = Path(script.get("root_dir") or "")
+      entry = script.get("entry")
+      if not entry:
+        return "❌ Entry point not set. Choose a file to run first."
+      entry_path = root / entry
+      if not entry_path.exists():
+        return f"❌ Entry file not found: {entry}"
+
+      venv_dir = Path(script.get("venv_dir") or self.app_venv_dir(script_id))
+      python_exe_path = venv_python_path(venv_dir)
+      if not python_exe_path.exists():
+        ok, out = await create_venv(venv_dir)
+        if not ok:
+          return "❌ Failed to create venv:\n" + safe_trim_text(out, 1500)
+      python_exe = str(python_exe_path)
+      cwd = str(root)
+      run_target = str(entry_path)
 
     env = os.environ.copy()
     env.update(self.meta.get("global_env", {}))
@@ -472,11 +964,11 @@ class ScriptManager:
     h = log_file.open("ab")
     self.log_handles[script_id] = h
 
-    logger.info("Starting script %s", script_id)
+    logger.info("Starting script %s via %s", script_id, python_exe)
     proc = await asyncio.create_subprocess_exec(
-        sys.executable,
-        file_path,
-        cwd=str(SCRIPTS_DIR),
+        python_exe,
+        run_target,
+        cwd=cwd,
         env=env,
         stdout=h,
         stderr=h,
@@ -575,14 +1067,23 @@ class ScriptManager:
       return []
     keys: set[str] = set(script.get("env", {}).keys())
 
-    file_path = script.get("file")
-    if file_path and Path(file_path).exists():
-      try:
-        source = read_text_file(Path(file_path))
-        detected = extract_env_keys(source)
-        keys |= detected
-      except Exception:
-        logger.exception("Failed to extract env keys for %s", script_id)
+    if script.get("type", "script") == "script":
+      file_path = script.get("file")
+      if file_path and Path(file_path).exists():
+        try:
+          source = read_text_file(Path(file_path))
+          keys |= extract_env_keys(source)
+        except Exception:
+          logger.exception("Failed to extract env keys for %s", script_id)
+    else:
+      root = Path(script.get("root_dir") or "")
+      if root.exists():
+        for rel in discover_python_files(root):
+          try:
+            source = read_text_file(root / rel)
+            keys |= extract_env_keys(source)
+          except Exception:
+            continue
     return sorted(keys)
 
   def get_versions(self, script_id: str) -> List[Dict[str, str]]:
@@ -607,6 +1108,9 @@ class ScriptManager:
     if not script:
       return "❌ Script not found."
 
+    if script.get("type", "script") != "script":
+      return await self._rollback_app_to(script_id, ts)
+
     versions = self.get_versions(script_id)
     chosen = None
     for v in versions:
@@ -620,6 +1124,11 @@ class ScriptManager:
     if not version_path.exists():
       return "❌ Version file missing on disk."
 
+    # Read the target version's bytes NOW. Snapshotting the current file below can (in rare
+    # cases, e.g. same-second timestamps) reuse this exact file name - reading it into memory
+    # first guarantees we always restore the content the user actually picked.
+    version_bytes = version_path.read_bytes()
+
     was_running = self.script_running(script_id)
     if was_running:
       await self.stop_script(script_id)
@@ -628,9 +1137,9 @@ class ScriptManager:
     if self.script_file_path(script_id).exists():
       self.snapshot_current_version(script_id)
 
-    # Replace current script with chosen version (copy, keep version file)
+    # Replace current script with chosen version
     try:
-      shutil.copy2(version_path, self.script_file_path(script_id))
+      self.script_file_path(script_id).write_bytes(version_bytes)
     except Exception:
       logger.exception("Rollback copy failed for %s", script_id)
       return "❌ Rollback failed (copy error)."
@@ -649,9 +1158,73 @@ class ScriptManager:
 
     return msg
 
+  async def _rollback_app_to(self, script_id: str, ts: str) -> str:
+    script = self.get_script(script_id)
+    if not script:
+      return "❌ App not found."
+
+    versions = self.get_versions(script_id)
+    chosen = next((v for v in versions if v["ts"] == ts), None)
+    if not chosen:
+      return "❌ Version not found."
+
+    version_path = Path(chosen["file"])
+    if not version_path.exists():
+      return "❌ Version file missing on disk."
+
+    root = Path(script.get("root_dir") or self.app_root_dir(script_id))
+
+    # Extract the target version into a temp dir FIRST (before snapshotting current, which
+    # could in rare cases - e.g. same-second timestamps - reuse this exact archive's file name).
+    tmp_extract = root.parent / f"__rollback_tmp_{script_id}"
+    shutil.rmtree(tmp_extract, ignore_errors=True)
+    try:
+      with tarfile.open(version_path, "r:gz") as tf:
+        tf.extractall(tmp_extract, filter="data")
+    except Exception:
+      logger.exception("App rollback extract failed for %s", script_id)
+      shutil.rmtree(tmp_extract, ignore_errors=True)
+      return "❌ Rollback failed (extract error)."
+
+    was_running = self.script_running(script_id)
+    if was_running:
+      await self.stop_script(script_id)
+
+    # Snapshot current before rollback
+    if root.exists():
+      self.snapshot_current_app_version(script_id)
+
+    try:
+      inner = tmp_extract / script_id
+      if not inner.exists():
+        inner = tmp_extract  # be defensive about older/foreign archives
+
+      shutil.rmtree(root, ignore_errors=True)
+      root.mkdir(parents=True, exist_ok=True)
+      for item in inner.iterdir():
+        shutil.move(str(item), str(root / item.name))
+    except Exception:
+      logger.exception("App rollback failed for %s", script_id)
+      return "❌ Rollback failed (move error)."
+    finally:
+      shutil.rmtree(tmp_extract, ignore_errors=True)
+
+    script = self.get_script(script_id)
+    if script:
+      script["updated_at"] = now_ts_str()
+      self.save_meta()
+
+    msg = f"⏪ Rolled back {script_id} to version {pretty_dt_from_ts(ts)}"
+
+    if was_running:
+      s = await self.start_script(script_id)
+      msg += f"\n{s}"
+
+    return msg
+
   # pip
 
-  async def pip_install(self, args_str: str) -> str:
+  async def pip_install(self, args_str: str, script_id: Optional[str] = None) -> str:
     try:
       args = shlex.split(args_str)
     except ValueError as e:
@@ -659,9 +1232,26 @@ class ScriptManager:
     if not args:
       return "❌ No packages specified."
 
-    logger.info("Running pip install via %s: %s", sys.executable, " ".join(args))
+    # For project/git apps, install into their own isolated venv + requirements.txt.
+    # Legacy scripts keep the previous behavior: shared interpreter + shared requirements.txt.
+    scoped = bool(script_id) and self.is_project_type(script_id)
+    if scoped:
+      script = self.get_script(script_id)
+      venv_dir = Path(script.get("venv_dir") or self.app_venv_dir(script_id))
+      python_exe_path = venv_python_path(venv_dir)
+      if not python_exe_path.exists():
+        ok, out = await create_venv(venv_dir)
+        if not ok:
+          return "❌ Failed to prepare venv:\n" + safe_trim_text(out, 1500)
+      python_exe = str(python_exe_path)
+      req_path = Path(script.get("root_dir")) / "requirements.txt"
+    else:
+      python_exe = sys.executable
+      req_path = REQUIREMENTS_FILE
+
+    logger.info("Running pip install via %s: %s", python_exe, " ".join(args))
     proc = await asyncio.create_subprocess_exec(
-        sys.executable,
+        python_exe,
         "-m",
         "pip",
         "install",
@@ -681,13 +1271,13 @@ class ScriptManager:
       # Keep original spec (with ==, extras, etc.)
       to_store.append(a)
 
-    saved = self.add_requirements(to_store)
+    saved = self.add_requirements(to_store, path=req_path)
 
     msg = []
-    msg.append(f"$ {sys.executable} -m pip install {' '.join(args)}")
+    msg.append(f"$ {python_exe} -m pip install {' '.join(args)}")
     msg.append(f"exit code: {exit_code}")
     if saved:
-      msg.append(f"📌 saved to requirements.txt ({len(to_store)} item(s))")
+      msg.append(f"📌 saved to {req_path.name} ({len(to_store)} item(s))" + (f" for app {script_id}" if scoped else ""))
     msg.append("")
     msg.append(text.strip() or "<no output>")
 
@@ -704,7 +1294,7 @@ class ScriptManager:
     for pkg in to_check:
       code = f"import {pkg}; print(getattr({pkg}, '__file__', '<no file>'))"
       check_proc = await asyncio.create_subprocess_exec(
-          sys.executable,
+          python_exe,
           "-c",
           code,
           stdout=asyncio.subprocess.PIPE,
@@ -728,6 +1318,9 @@ class ScriptManager:
     s = self.get_script(script_id)
     return "🚀" if s and s.get("autostart") else "⏸️"
 
+  def _type_emoji(self, script_id: str) -> str:
+    return {"script": "📄", "project": "📦", "git": "🌐"}.get(self.get_type(script_id), "📄")
+
   def _versions_count(self, script_id: str) -> int:
     return len(self.get_versions(script_id))
 
@@ -746,11 +1339,12 @@ class ScriptManager:
 
   def script_status_line(self, script_id: str) -> str:
     st = self._status_emoji(script_id)
+    ty = self._type_emoji(script_id)
     au = self._autostart_emoji(script_id)
     pid = self._pid(script_id)
     vc = self._versions_count(script_id)
     upd = self._updated_at_pretty(script_id)
-    return f"{st} {au} {script_id}  | PID: {pid} | v:{vc} | updated: {upd}"
+    return f"{st}{ty} {au} {script_id}  | PID: {pid} | v:{vc} | updated: {upd}"
 
   def get_status_lines(self) -> str:
     scripts = self.meta.get("scripts", {})
@@ -769,7 +1363,7 @@ def main_menu_keyboard() -> InlineKeyboardMarkup:
   scripts = script_mgr.list_scripts()
   buttons = []
   for sid in scripts.keys():
-    text = f"{script_mgr._status_emoji(sid)} {script_mgr._autostart_emoji(sid)} {sid}"
+    text = f"{script_mgr._status_emoji(sid)}{script_mgr._type_emoji(sid)} {script_mgr._autostart_emoji(sid)} {sid}"
     buttons.append([InlineKeyboardButton(text=text, callback_data=f"menu:{sid}")])
   if not buttons:
     buttons.append([InlineKeyboardButton(text="😴 No scripts", callback_data="noop")])
@@ -777,6 +1371,7 @@ def main_menu_keyboard() -> InlineKeyboardMarkup:
 
 
 def script_menu_keyboard(script_id: str) -> InlineKeyboardMarkup:
+  # Menu for legacy single-file (.py) scripts - kept exactly as before (full BWC).
   script = script_mgr.get_script(script_id)
   autostart = script.get("autostart") if script else False
   running = script_mgr.script_running(script_id)
@@ -807,6 +1402,47 @@ def script_menu_keyboard(script_id: str) -> InlineKeyboardMarkup:
     ],
   ]
   return InlineKeyboardMarkup(buttons)
+
+
+def app_menu_keyboard(script_id: str) -> InlineKeyboardMarkup:
+  # Menu for apps imported from an archive or a GitHub repo (own isolated venv).
+  script = script_mgr.get_script(script_id)
+  autostart = script.get("autostart") if script else False
+  running = script_mgr.script_running(script_id)
+  app_type = (script or {}).get("type", "project")
+
+  run_text = "▶ Run" if not running else "🔁 Restart"
+  stop_text = "⏹ Stop"
+  auto_text = "🚀 Autostart: ON" if autostart else "⏸️ Autostart: OFF"
+
+  logs_row = [InlineKeyboardButton("📜 Logs", callback_data=f"logs:{script_id}")]
+  if app_type == "git":
+    logs_row.append(InlineKeyboardButton("🔄 Sync", callback_data=f"sync:{script_id}"))
+
+  buttons = [
+    [
+      InlineKeyboardButton(run_text, callback_data=f"run:{script_id}"),
+      InlineKeyboardButton(stop_text, callback_data=f"stop:{script_id}"),
+    ],
+    logs_row,
+    [
+      InlineKeyboardButton("🧪 Env", callback_data=f"envmenu:{script_id}"),
+      InlineKeyboardButton("📦 Pip install", callback_data=f"pipprompt:{script_id}"),
+    ],
+    [
+      InlineKeyboardButton("⏪ Rollback", callback_data=f"rbmenu:{script_id}"),
+      InlineKeyboardButton(auto_text, callback_data=f"auto:{script_id}"),
+    ],
+    [
+      InlineKeyboardButton("⬅ Back", callback_data="back:main"),
+    ],
+  ]
+  return InlineKeyboardMarkup(buttons)
+
+
+def menu_keyboard_for(script_id: str) -> InlineKeyboardMarkup:
+  app_type = script_mgr.get_type(script_id)
+  return script_menu_keyboard(script_id) if app_type == "script" else app_menu_keyboard(script_id)
 
 
 def env_menu_text(script_id: str) -> str:
@@ -866,8 +1502,200 @@ async def send_env_menu(chat_id: int, script_id: str, context: ContextTypes.DEFA
   await context.bot.send_message(chat_id=chat_id, text=env_menu_text(script_id), reply_markup=env_menu_keyboard(script_id))
 
 
-async def send_script_menu(chat_id: int, script_id: str, context: ContextTypes.DEFAULT_TYPE) -> None:
-  await context.bot.send_message(chat_id=chat_id, text=script_mgr.script_status_line(script_id), reply_markup=script_menu_keyboard(script_id))
+async def send_app_menu(chat_id: int, script_id: str, context: ContextTypes.DEFAULT_TYPE) -> None:
+  await context.bot.send_message(chat_id=chat_id, text=script_mgr.script_status_line(script_id), reply_markup=menu_keyboard_for(script_id))
+
+
+# Backward-compatible alias (kept in case anything external referenced this name)
+send_script_menu = send_app_menu
+
+
+# New apps: archives + GitHub repos
+
+async def present_setup_result(
+    chat_id: int,
+    context: ContextTypes.DEFAULT_TYPE,
+    script_id: str,
+    result: Dict[str, Any],
+    header: str,
+) -> None:
+  if result.get("status") == "error":
+    await context.bot.send_message(
+        chat_id=chat_id,
+        text=f"❌ {header}\n{safe_trim_text(result.get('message', ''), 3500)}",
+    )
+    return
+
+  if result.get("status") == "ambiguous":
+    candidates = result.get("candidates", [])
+    buttons = [
+        [InlineKeyboardButton(f"▶ {c}", callback_data=f"entrypick:{script_id}:{i}")]
+        for i, c in enumerate(candidates[:20])
+    ]
+    await context.bot.send_message(
+        chat_id=chat_id,
+        text=f"{header}\n\n🤔 Found {len(candidates)} Python files and no main.py. Which one should I run?",
+        reply_markup=InlineKeyboardMarkup(buttons),
+    )
+    return
+
+  entry = result.get("entry")
+  req_pkgs = result.get("requirements_pkgs") or []
+  lines = [header, "", f"📄 Entry point: {entry}"]
+  if not result.get("venv_ok", True):
+    lines.append("⚠️ Failed to create virtual environment:")
+    lines.append(safe_trim_text(result.get("venv_out", ""), 800))
+
+  if req_pkgs:
+    lines.append(f"📦 requirements.txt found ({len(req_pkgs)} package(s)): {', '.join(req_pkgs[:15])}")
+    await context.bot.send_message(
+        chat_id=chat_id,
+        text=safe_trim_text("\n".join(lines), 3500),
+        reply_markup=InlineKeyboardMarkup(
+            [
+              [InlineKeyboardButton("📥 Install & Run", callback_data=f"reqinstall:{script_id}")],
+              [InlineKeyboardButton("▶ Run without installing", callback_data=f"reqskip:{script_id}")],
+            ]
+        ),
+    )
+  else:
+    run_msg = await script_mgr.start_script(script_id)
+    lines.append("")
+    lines.append(run_msg)
+    await context.bot.send_message(chat_id=chat_id, text=safe_trim_text("\n".join(lines), 3500))
+
+  await send_env_menu(chat_id, script_id, context)
+  await send_app_menu(chat_id, script_id, context)
+
+
+async def handle_archive_upload(update: Update, context: ContextTypes.DEFAULT_TYPE, doc) -> None:
+  filename = doc.file_name
+  app_id = sanitize_id(strip_archive_ext(filename))
+
+  status_msg = await update.message.reply_text(f"📦 Downloading {filename} ...")
+  tmp_archive = TMP_DIR / f"upload_{app_id}_{int(datetime.now().timestamp())}{archive_ext_of(filename)}"
+  try:
+    file = await doc.get_file()
+    await file.download_to_drive(str(tmp_archive))
+
+    await status_msg.edit_text(f"📦 Extracting {filename} ...")
+    staging = TMP_DIR / f"extract_{app_id}_{int(datetime.now().timestamp())}"
+    shutil.rmtree(staging, ignore_errors=True)
+    try:
+      extract_archive(tmp_archive, staging)
+    except Exception as e:
+      logger.exception("Extraction failed for %s", filename)
+      await status_msg.edit_text(f"❌ Failed to extract archive: {e}")
+      shutil.rmtree(staging, ignore_errors=True)
+      return
+
+    extraction_root = find_extraction_root(staging)
+
+    await status_msg.edit_text(f"⚙️ Setting up app {app_id} ...")
+    result = await script_mgr.setup_project_app(app_id, extraction_root, "project")
+    if staging.exists() and staging != extraction_root:
+      shutil.rmtree(staging, ignore_errors=True)
+
+    await status_msg.delete()
+    await present_setup_result(
+        update.effective_chat.id, context, app_id, result, f"✅ App {app_id} imported from {filename}."
+    )
+  finally:
+    tmp_archive.unlink(missing_ok=True)
+
+
+async def setup_git_app(info: Dict[str, Any]) -> Dict[str, Any]:
+  app_id = info["app_id"]
+  repo_dir = GITREPOS_DIR / app_id
+  repo_url = f"https://github.com/{info['owner']}/{info['repo']}.git"
+
+  ok, out = await git_clone_or_pull(repo_url, info.get("branch"), repo_dir)
+  if not ok:
+    return {"status": "error", "message": out}
+
+  branch = info.get("branch") or await git_current_branch(repo_dir)
+
+  source_root = (repo_dir / info["path"]) if info.get("path") else repo_dir
+  if not source_root.exists():
+    return {"status": "error", "message": f"Path not found in repo: {info.get('path')}"}
+
+  staging = TMP_DIR / f"gitstage_{app_id}_{int(datetime.now().timestamp())}"
+  shutil.rmtree(staging, ignore_errors=True)
+  shutil.copytree(source_root, staging, ignore=shutil.ignore_patterns(".git"))
+
+  git_info = {
+      "owner": info["owner"],
+      "repo": info["repo"],
+      "branch": branch,
+      "path": info.get("path"),
+      "repo_dir": str(repo_dir),
+  }
+  result = await script_mgr.setup_project_app(app_id, staging, "git", git_info)
+  result["app_id"] = app_id
+  return result
+
+
+async def sync_git_app(script_id: str) -> Dict[str, Any]:
+  script = script_mgr.get_script(script_id)
+  if not script or script.get("type") != "git":
+    return {"status": "error", "message": "Not a GitHub app."}
+
+  git_info = script.get("git", {})
+  repo_dir = Path(git_info.get("repo_dir") or (GITREPOS_DIR / script_id))
+  branch = git_info.get("branch")
+  repo_url = f"https://github.com/{git_info.get('owner')}/{git_info.get('repo')}.git"
+
+  ok, out = await git_clone_or_pull(repo_url, branch, repo_dir)
+  if not ok:
+    return {"status": "error", "message": out}
+
+  source_root = (repo_dir / git_info["path"]) if git_info.get("path") else repo_dir
+  if not source_root.exists():
+    return {"status": "error", "message": f"Path not found in repo: {git_info.get('path')}"}
+
+  old_req_path = Path(script.get("root_dir", "")) / "requirements.txt"
+  old_req_text = read_text_file(old_req_path) if old_req_path.exists() else ""
+
+  staging = TMP_DIR / f"gitstage_{script_id}_{int(datetime.now().timestamp())}"
+  shutil.rmtree(staging, ignore_errors=True)
+  shutil.copytree(source_root, staging, ignore=shutil.ignore_patterns(".git"))
+
+  was_running = script_mgr.script_running(script_id)
+  if was_running:
+    await script_mgr.stop_script(script_id)
+
+  result = await script_mgr.setup_project_app(script_id, staging, "git", git_info)
+
+  updated_script = script_mgr.get_script(script_id) or {}
+  new_req_path = Path(updated_script.get("root_dir", "")) / "requirements.txt"
+  new_req_text = read_text_file(new_req_path) if new_req_path.exists() else ""
+
+  result["deps_changed"] = new_req_text.strip() != old_req_text.strip()
+  result["was_running"] = was_running
+  return result
+
+
+async def process_github_url(update: Update, context: ContextTypes.DEFAULT_TYPE, url: str) -> None:
+  info = parse_github_url(url)
+  if not info:
+    await update.message.reply_text(
+        "❌ Doesn't look like a GitHub repo URL.\n"
+        "Expected: https://github.com/owner/repo\n"
+        "Or with a subfolder: https://github.com/owner/repo/tree/branch/path"
+    )
+    return
+
+  status_msg = await update.message.reply_text(f"🌐 Cloning {info['owner']}/{info['repo']} ...")
+  result = await setup_git_app(info)
+  await status_msg.delete()
+
+  if result.get("status") == "error":
+    await update.message.reply_text(f"❌ Failed to import repo:\n{safe_trim_text(result.get('message', ''), 3500)}")
+    return
+
+  await present_setup_result(
+      update.effective_chat.id, context, result["app_id"], result, f"✅ App {result['app_id']} cloned from GitHub."
+  )
 
 
 # Commands
@@ -877,19 +1705,37 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     return
   await update.message.reply_text(
       "🤖 Script manager ready.\n\n"
+      "📄 Single scripts:\n"
+      "• Send a .py file, or /new <name> + text — run/stop/edit/env/pip/rollback as before\n\n"
+      "📦 Multi-file apps (archives):\n"
+      "• Send a .zip / .tar.gz / .tgz / .tar / .7z file\n"
+      "• I'll unpack it, find requirements.txt (offer to install) and detect main.py\n"
+      "• If there's only one .py file (or a main.py), I run it automatically\n"
+      "• If there are several files and no main.py, I'll ask which one to run\n"
+      "• The app name is the archive name (without extension)\n"
+      "• Each such app gets its own isolated Python venv (only the telegram lib is shared)\n\n"
+      "🌐 Apps from GitHub:\n"
+      "• Just send a link, e.g. https://github.com/owner/repo\n"
+      "• Or a subfolder link: https://github.com/owner/repo/tree/branch/path\n"
+      "  (app name becomes repo-folder, e.g. myrepo-myapp)\n"
+      "• Or use /repo <url>\n"
+      "• These apps get a 🔄 Sync button: re-pulls the repo, offers to install new deps, and runs it\n\n"
       "Main:\n"
-      "• /menu — scripts menu\n"
-      "• /list — list scripts (rich)\n"
+      "• /menu — apps/scripts menu\n"
+      "• /list — list apps/scripts (rich)\n"
       "• /new <name> — create script from next text message\n"
+      "• /repo <github_url> — import an app from a GitHub repo\n"
       "• /run <id>, /stop <id>\n"
       "• /logs <id>\n"
       "• /monitoring — CPU/MEM for running scripts\n\n"
       "Packages:\n"
-      "• /pip <args> — pip install (saved to requirements.txt)\n\n"
+      "• /pip <args> — pip install\n"
+      "  (scripts: shared requirements.txt; apps: their own venv + requirements.txt)\n\n"
       "Env:\n"
       "• /envmenu <id>\n"
       "• /env <id>, /setenv, /delenv\n"
       "• /globalenv, /setglobal, /delglobal\n\n"
+      "Legend: 📄 script  📦 archive app  🌐 GitHub app\n"
       "Tip: For /monitoring install psutil via /pip psutil"
   )
 
@@ -924,6 +1770,20 @@ async def cmd_new(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
   script_mgr.pending_pip.pop(user_id, None)
 
   await update.message.reply_text(f"✍️ Send script body as text. It will be saved as {script_id}.py")
+
+
+async def cmd_repo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+  if not is_authorized(update):
+    return
+  if not context.args:
+    await update.message.reply_text(
+        "Usage: /repo <github_url>\n"
+        "Example: /repo https://github.com/owner/repo\n"
+        "With subfolder: /repo https://github.com/owner/repo/tree/main/subdir\n\n"
+        "Tip: you can also just paste the link as a plain message."
+    )
+    return
+  await process_github_url(update, context, context.args[0])
 
 
 async def cmd_envmenu(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -1167,10 +2027,10 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     if value == "-":
       await update.message.reply_text("🟡 Pip install cancelled.")
     else:
-      msg = await script_mgr.pip_install(value)
+      msg = await script_mgr.pip_install(value, script_id=script_id)
       await update.message.reply_text(msg)
     if script_id:
-      await send_script_menu(update.effective_chat.id, script_id, context)
+      await send_app_menu(update.effective_chat.id, script_id, context)
     return
 
   # env value flow
@@ -1211,6 +2071,12 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     await send_env_menu(update.effective_chat.id, script_id, context)
     return
 
+  # GitHub repo link, sent as a plain message (only if no other flow matched above)
+  gh_info = parse_github_url(text.strip())
+  if gh_info:
+    await process_github_url(update, context, text.strip())
+    return
+
   logger.info("Ignored text from user_id=%s (no pending state)", user_id)
 
 
@@ -1218,20 +2084,30 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
   if not is_authorized(update):
     return
   doc = update.message.document
-  if not doc.file_name.lower().endswith(".py"):
-    await update.message.reply_text("❌ Only .py files are accepted.")
+  filename = doc.file_name or "file"
+  lower = filename.lower()
+
+  if lower.endswith(".py"):
+    tmp_path = SCRIPTS_DIR / ("_upload_tmp_" + filename)
+    file = await doc.get_file()
+    await file.download_to_drive(str(tmp_path))
+
+    script_id = script_mgr.upsert_script_from_file(filename, tmp_path)
+    tmp_path.unlink(missing_ok=True)
+
+    await update.message.reply_text(f"✅ Script {script_id} saved from file.\n📦 Version saved (if it overwrote existing script).")
+    await send_app_menu(update.effective_chat.id, script_id, context)
+    await send_env_menu(update.effective_chat.id, script_id, context)
     return
 
-  tmp_path = SCRIPTS_DIR / ("_upload_tmp_" + doc.file_name)
-  file = await doc.get_file()
-  await file.download_to_drive(str(tmp_path))
+  if lower.endswith(ARCHIVE_EXTENSIONS):
+    await handle_archive_upload(update, context, doc)
+    return
 
-  script_id = script_mgr.upsert_script_from_file(doc.file_name, tmp_path)
-  tmp_path.unlink(missing_ok=True)
-
-  await update.message.reply_text(f"✅ Script {script_id} saved from file.\n📦 Version saved (if it overwrote existing script).")
-  await send_script_menu(update.effective_chat.id, script_id, context)
-  await send_env_menu(update.effective_chat.id, script_id, context)
+  await update.message.reply_text(
+      "❌ Unsupported file type.\n"
+      "Send a .py file, or an archive: .zip / .tar.gz / .tgz / .tar / .7z"
+  )
 
 
 async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -1254,19 +2130,19 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     if not script_mgr.get_script(script_id):
       await query.edit_message_text("❌ Script not found.")
       return
-    await query.edit_message_text(script_mgr.script_status_line(script_id), reply_markup=script_menu_keyboard(script_id))
+    await query.edit_message_text(script_mgr.script_status_line(script_id), reply_markup=menu_keyboard_for(script_id))
     return
 
   if data.startswith("run:"):
     script_id = data.split(":", 1)[1]
     msg = await script_mgr.restart_script(script_id)
-    await query.edit_message_text(safe_trim_text(msg, 3900), reply_markup=script_menu_keyboard(script_id))
+    await query.edit_message_text(safe_trim_text(msg, 3900), reply_markup=menu_keyboard_for(script_id))
     return
 
   if data.startswith("stop:"):
     script_id = data.split(":", 1)[1]
     msg = await script_mgr.stop_script(script_id)
-    await query.edit_message_text(msg, reply_markup=script_menu_keyboard(script_id))
+    await query.edit_message_text(msg, reply_markup=menu_keyboard_for(script_id))
     return
 
   if data.startswith("logs:"):
@@ -1284,8 +2160,16 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
 
   if data.startswith("edit:"):
     script_id = data.split(":", 1)[1]
-    if not script_mgr.get_script(script_id):
+    script = script_mgr.get_script(script_id)
+    if not script:
       await query.edit_message_text("❌ Script not found.")
+      return
+    if script.get("type", "script") != "script":
+      hint = " Use 🔄 Sync to pull the latest code." if script.get("type") == "git" else " Re-upload an archive with the same name to update it."
+      await query.edit_message_text(
+          "✏️ Editing multi-file apps via chat isn't supported." + hint,
+          reply_markup=menu_keyboard_for(script_id),
+      )
       return
     user_id = query.from_user.id
     script_mgr.pending_edit[user_id] = script_id
@@ -1309,7 +2193,7 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     script_mgr.set_autostart(script_id, not current)
     await query.edit_message_text(
         f"{'🚀' if not current else '⏸️'} Autostart for {script_id}: {'ON' if not current else 'OFF'}",
-        reply_markup=script_menu_keyboard(script_id),
+        reply_markup=menu_keyboard_for(script_id),
     )
     return
 
@@ -1342,7 +2226,7 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     if not script_mgr.get_script(script_id):
       await query.edit_message_text("❌ Script not found.")
       return
-    await query.edit_message_text("✅ Env updated.", reply_markup=script_menu_keyboard(script_id))
+    await query.edit_message_text("✅ Env updated.", reply_markup=menu_keyboard_for(script_id))
     return
 
   if data.startswith("envrun:"):
@@ -1351,7 +2235,7 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
       await query.edit_message_text("❌ Script not found.")
       return
     msg = await script_mgr.restart_script(script_id)
-    await query.edit_message_text(safe_trim_text(msg, 3900), reply_markup=script_menu_keyboard(script_id))
+    await query.edit_message_text(safe_trim_text(msg, 3900), reply_markup=menu_keyboard_for(script_id))
     return
 
   if data.startswith("pipprompt:"):
@@ -1361,10 +2245,12 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     script_mgr.pending_new.pop(user_id, None)
     script_mgr.pending_edit.pop(user_id, None)
     script_mgr.pending_env_value.pop(user_id, None)
+    scoped = script_mgr.is_project_type(script_id)
     await query.edit_message_text(
         "📦 Send pip install args (e.g. `python-telegram-bot==21.6 openai psutil`).\n"
-        "Saved into requirements.txt automatically.\n"
-        "Send '-' to cancel."
+        + ("Installed into this app's own venv and saved into its requirements.txt.\n" if scoped
+           else "Saved into requirements.txt automatically.\n")
+        + "Send '-' to cancel."
     )
     return
 
@@ -1386,15 +2272,113 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
       await query.edit_message_text("❌ Script not found.")
       return
     msg = await script_mgr.rollback_to(script_id, ts)
-    await query.edit_message_text(safe_trim_text(msg, 3900), reply_markup=script_menu_keyboard(script_id))
+    await query.edit_message_text(safe_trim_text(msg, 3900), reply_markup=menu_keyboard_for(script_id))
+    return
+
+  if data.startswith("entrypick:"):
+    # entrypick:<script_id>:<index>
+    _, script_id, idx_str = data.split(":", 2)
+    candidates = script_mgr.pending_entry_choice.pop(script_id, None)
+    script = script_mgr.get_script(script_id)
+    if not script or not candidates:
+      await query.edit_message_text("❌ Selection expired or app not found. Please re-upload / re-sync.")
+      return
+    try:
+      idx = int(idx_str)
+      entry = candidates[idx]
+    except (ValueError, IndexError):
+      await query.edit_message_text("❌ Invalid choice.")
+      return
+
+    script["entry"] = entry
+    script_mgr.save_meta()
+    await query.edit_message_text(f"✅ Entry point set to {entry}.")
+
+    root = Path(script.get("root_dir", ""))
+    result = {
+        "status": "ready",
+        "entry": entry,
+        "venv_ok": True,
+        "requirements_pkgs": find_requirements_pkgs(root) if root.exists() else [],
+    }
+    await present_setup_result(
+        query.message.chat_id, context, script_id, result, f"✅ App {script_id} configured."
+    )
+    return
+
+  if data.startswith("reqinstall:"):
+    script_id = data.split(":", 1)[1]
+    if not script_mgr.get_script(script_id):
+      await query.edit_message_text("❌ App not found.")
+      return
+    await query.edit_message_text("📥 Installing requirements ...")
+    install_msg = await script_mgr.install_app_requirements(script_id)
+    run_msg = await script_mgr.start_script(script_id)
+    await context.bot.send_message(
+        chat_id=query.message.chat_id,
+        text=safe_trim_text(f"{install_msg}\n\n{run_msg}", 3900),
+        reply_markup=menu_keyboard_for(script_id),
+    )
+    return
+
+  if data.startswith("reqskip:"):
+    script_id = data.split(":", 1)[1]
+    if not script_mgr.get_script(script_id):
+      await query.edit_message_text("❌ App not found.")
+      return
+    run_msg = await script_mgr.start_script(script_id)
+    await query.edit_message_text(run_msg, reply_markup=menu_keyboard_for(script_id))
+    return
+
+  if data.startswith("sync:"):
+    script_id = data.split(":", 1)[1]
+    script = script_mgr.get_script(script_id)
+    if not script or script.get("type") != "git":
+      await query.edit_message_text("❌ App not found or not a GitHub app.")
+      return
+    await query.edit_message_text("🔄 Syncing ...")
+    result = await sync_git_app(script_id)
+
+    if result.get("status") == "error":
+      await context.bot.send_message(
+          chat_id=query.message.chat_id,
+          text=f"❌ Sync failed:\n{safe_trim_text(result.get('message', ''), 3500)}",
+          reply_markup=menu_keyboard_for(script_id),
+      )
+      return
+
+    if result.get("status") == "ambiguous":
+      await present_setup_result(query.message.chat_id, context, script_id, result, f"🔄 Synced {script_id}.")
+      return
+
+    run_msg = await script_mgr.start_script(script_id)
+    lines = [f"🔄 Synced {script_id}.", run_msg]
+
+    if result.get("deps_changed"):
+      updated_script = script_mgr.get_script(script_id) or {}
+      req_pkgs = find_requirements_pkgs(Path(updated_script.get("root_dir", "")))
+      lines.append("")
+      lines.append(f"📦 requirements.txt changed! ({len(req_pkgs)} package(s))" if req_pkgs else "📦 requirements.txt changed!")
+      await context.bot.send_message(
+          chat_id=query.message.chat_id,
+          text=safe_trim_text("\n".join(lines), 3500),
+          reply_markup=InlineKeyboardMarkup(
+              [[InlineKeyboardButton("📥 Install new requirements & Restart", callback_data=f"reqinstall:{script_id}")]]
+          ),
+      )
+    else:
+      await context.bot.send_message(chat_id=query.message.chat_id, text=safe_trim_text("\n".join(lines), 3500))
+
+    await send_app_menu(query.message.chat_id, script_id, context)
     return
 
 
 # Startup
 
 async def on_startup(app: Application) -> None:
-  logger.info("Bot startup: install requirements + autostart scripts")
+  logger.info("Bot startup: install requirements + prepare app venvs + autostart")
   await script_mgr.ensure_requirements_installed()
+  await script_mgr.ensure_app_environments()
   await script_mgr.autostart_all()
 
 
@@ -1405,6 +2389,7 @@ def main() -> None:
   application.add_handler(CommandHandler("menu", cmd_menu))
   application.add_handler(CommandHandler("list", cmd_list))
   application.add_handler(CommandHandler("new", cmd_new))
+  application.add_handler(CommandHandler("repo", cmd_repo))
 
   application.add_handler(CommandHandler("run", cmd_run))
   application.add_handler(CommandHandler("stop", cmd_stop))
