@@ -58,7 +58,7 @@ async def test_git_clone_or_pull_pulls_new_commits(app, local_repo, tmp_path):
 
 @pytest.mark.asyncio
 async def test_setup_git_app_imports_subfolder(script_mgr, app, fast_venv, local_repo, monkeypatch):
-  # setup_git_app builds the clone URL from owner/repo; point it at our local repo
+  # _prepare_git_app builds the clone URL from owner/repo; point it at our local repo
   # by making the constructed https URL resolve to a local file:// path instead.
   info = {
       "owner": "owner",
@@ -75,7 +75,14 @@ async def test_setup_git_app_imports_subfolder(script_mgr, app, fast_venv, local
 
   monkeypatch.setattr(app, "git_clone_or_pull", fake_clone_or_pull)
 
-  result = await app.setup_git_app(info)
+  prep = await app._prepare_git_app(info)
+  assert "staged_root" in prep, prep.get("message", "prepare failed")
+
+  result = await script_mgr.setup_project_app(
+      prep["app_id"], prep["staged_root"], "git", prep["git_info"]
+  )
+  result["app_id"] = prep["app_id"]
+
   assert result["status"] == "ready"
   assert result["entry"] == "main.py"
   assert result["requirements_pkgs"] == ["requests"]
@@ -100,7 +107,9 @@ async def test_sync_git_app_detects_dependency_changes(script_mgr, app, fast_ven
 
   monkeypatch.setattr(app, "git_clone_or_pull", fake_clone_or_pull)
 
-  await app.setup_git_app(info)
+  prep = await app._prepare_git_app(info)
+  assert "staged_root" in prep, prep.get("message", "prepare failed")
+  await script_mgr.setup_project_app(prep["app_id"], prep["staged_root"], "git", prep["git_info"])
 
   # no upstream change yet -> sync should report no dependency changes
   result = await app.sync_git_app("myrepo-subapp")

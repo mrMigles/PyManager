@@ -404,6 +404,12 @@ class ScriptManager:
     self.pending_env_value: Dict[int, Dict[str, str]] = {}
     self.pending_pip: Dict[int, Optional[str]] = {}
     self.pending_entry_choice: Dict[str, List[str]] = {}  # app_id -> candidate py files
+    # keyed by script_id; holds the staged data for a cross-type conversion awaiting
+    # the user's ✅ Convert / ❌ Cancel confirmation
+    self.pending_type_conversion: Dict[str, Dict[str, Any]] = {}
+    # keyed by user_id; value is the target script_id that the user wants to
+    # replace with a new source (file / archive / GitHub link)
+    self.pending_source_change: Dict[int, str] = {}
 
     self.load_meta()
 
@@ -657,12 +663,18 @@ class ScriptManager:
     prepares an isolated venv, and detects the entry point + requirements."""
     dest_root = self.app_root_dir(script_id)
 
+    # Stop any running process before replacing files on disk.
+    if self.script_running(script_id):
+      await self.stop_script(script_id)
+
     existing = self.get_script(script_id)
     if existing:
       if existing.get("type", "script") == "script":
         self.snapshot_current_version(script_id)
       else:
         self.snapshot_current_app_version(script_id)
+      # Remove artifacts that belong exclusively to the old type.
+      self._clear_type_artifacts(script_id, existing, "app")
 
     if dest_root.exists():
       shutil.rmtree(dest_root, ignore_errors=True)
@@ -729,7 +741,16 @@ class ScriptManager:
     text = safe_trim_text(out.decode("utf-8", errors="replace"), 3200)
     return f"📥 pip install -r requirements.txt (exit={proc.returncode})\n{text}"
 
-  def _push_version(self, script_id: str, version_file: Path, ts: str) -> None:
+  def _push_version(
+      self,
+      script_id: str,
+      version_file: Path,
+      ts: str,
+      *,
+      kind: str = "script",
+      app_type: Optional[str] = None,
+      git: Optional[Dict[str, Any]] = None,
+  ) -> None:
     script = self.get_script(script_id)
     if not script:
       return
@@ -738,7 +759,12 @@ class ScriptManager:
       versions = []
       script["versions"] = versions
 
-    versions.insert(0, {"ts": ts, "file": str(version_file)})
+    entry: Dict[str, Any] = {"ts": ts, "file": str(version_file), "kind": kind}
+    if app_type is not None:
+      entry["app_type"] = app_type
+    if git is not None:
+      entry["git"] = git
+    versions.insert(0, entry)
 
     # Trim versions list and delete old files
     while len(versions) > MAX_VERSIONS_PER_SCRIPT:
@@ -781,7 +807,7 @@ class ScriptManager:
     version_file = self._unique_version_path(vdir, script_id, ts, ".py")
     try:
       shutil.copy2(cur_path, version_file)
-      self._push_version(script_id, version_file, ts)
+      self._push_version(script_id, version_file, ts, kind="script")
       logger.info("Snapshot version for %s -> %s", script_id, version_file.name)
     except Exception:
       logger.exception("Failed to snapshot version for %s", script_id)
@@ -800,7 +826,14 @@ class ScriptManager:
     try:
       with tarfile.open(version_file, "w:gz") as tf:
         tf.add(root, arcname=script_id)
-      self._push_version(script_id, version_file, ts)
+      self._push_version(
+          script_id,
+          version_file,
+          ts,
+          kind="app",
+          app_type=script.get("type"),
+          git=script.get("git"),
+      )
       logger.info("Snapshot app version for %s -> %s", script_id, version_file.name)
     except Exception:
       logger.exception("Failed to snapshot app version for %s", script_id)
@@ -810,9 +843,14 @@ class ScriptManager:
     if not script_id:
       raise ValueError("empty script name")
 
-    # If script already exists, snapshot before overwriting
-    if self.get_script(script_id) and self.script_file_path(script_id).exists():
-      self.snapshot_current_version(script_id)
+    # Snapshot the current state before overwriting, then clean up old-type artifacts.
+    existing = self.get_script(script_id)
+    if existing:
+      if existing.get("type", "script") != "script":
+        self.snapshot_current_app_version(script_id)
+        self._clear_type_artifacts(script_id, existing, "script")
+      elif self.script_file_path(script_id).exists():
+        self.snapshot_current_version(script_id)
 
     file_path = self.script_file_path(script_id)
     write_text_file_atomic(file_path, content)
@@ -833,9 +871,14 @@ class ScriptManager:
     if not script_id:
       script_id = f"script_{len(self.meta.get('scripts', {})) + 1}"
 
-    # Snapshot before overwriting
-    if self.get_script(script_id) and self.script_file_path(script_id).exists():
-      self.snapshot_current_version(script_id)
+    # Snapshot the current state before overwriting, then clean up old-type artifacts.
+    existing = self.get_script(script_id)
+    if existing:
+      if existing.get("type", "script") != "script":
+        self.snapshot_current_app_version(script_id)
+        self._clear_type_artifacts(script_id, existing, "script")
+      elif self.script_file_path(script_id).exists():
+        self.snapshot_current_version(script_id)
 
     content = read_text_file(content_path)
     file_path = self.script_file_path(script_id)
@@ -1086,82 +1129,102 @@ class ScriptManager:
             continue
     return sorted(keys)
 
-  def get_versions(self, script_id: str) -> List[Dict[str, str]]:
+  def get_versions(self, script_id: str) -> List[Dict[str, Any]]:
     script = self.get_script(script_id)
     if not script:
       return []
     versions = script.get("versions", [])
     if not isinstance(versions, list):
       return []
-    out: List[Dict[str, str]] = []
+    out: List[Dict[str, Any]] = []
     for v in versions:
       if not isinstance(v, dict):
         continue
       ts = str(v.get("ts", "")).strip()
       fp = str(v.get("file", "")).strip()
       if ts and fp:
-        out.append({"ts": ts, "file": fp})
+        entry: Dict[str, Any] = {"ts": ts, "file": fp}
+        for extra_key in ("kind", "app_type", "git"):
+          if extra_key in v:
+            entry[extra_key] = v[extra_key]
+        out.append(entry)
     return out[:MAX_VERSIONS_PER_SCRIPT]
 
+  # --- type-conversion helpers -------------------------------------------------
+
+  def _clear_type_artifacts(self, script_id: str, old_script: Dict[str, Any], new_kind: str) -> None:
+    """Remove the on-disk artifacts and stale meta keys that belong exclusively
+    to the *old* type of an app being converted to *new_kind* ("script"/"app").
+    The caller is responsible for saving meta afterwards."""
+    old_type = old_script.get("type", "script")
+    old_kind = "script" if old_type == "script" else "app"
+    if old_kind == new_kind:
+      return  # nothing to do; same storage model
+
+    if old_kind == "script":
+      # script → app: remove the .py source file and its meta key
+      old_file = old_script.get("file") or str(self.script_file_path(script_id))
+      fp = Path(old_file)
+      if fp.exists():
+        try:
+          fp.unlink()
+        except Exception:
+          logger.exception("_clear_type_artifacts: failed to delete old script file for %s", script_id)
+      old_script.pop("file", None)
+    else:
+      # app → script: remove the app source tree, its venv, and (for git) the repo clone
+      root_dir = old_script.get("root_dir")
+      if root_dir:
+        shutil.rmtree(root_dir, ignore_errors=True)
+      venv_dir = old_script.get("venv_dir")
+      if venv_dir:
+        shutil.rmtree(venv_dir, ignore_errors=True)
+      if old_type == "git":
+        git_meta = old_script.get("git", {})
+        repo_dir = git_meta.get("repo_dir") or str(GITREPOS_DIR / script_id)
+        shutil.rmtree(repo_dir, ignore_errors=True)
+      for key in ("root_dir", "venv_dir", "entry", "git"):
+        old_script.pop(key, None)
+
+  def conflicting_type(self, script_id: str, new_type: str) -> Optional[str]:
+    """Return the existing type string if it differs from *new_type*, else None."""
+    s = self.get_script(script_id)
+    if not s:
+      return None
+    existing = s.get("type", "script")
+    return existing if existing != new_type else None
+
+  def _set_pending_conversion(self, script_id: str, stash: Dict[str, Any]) -> None:
+    """Stash a pending type-conversion, cleaning up any previous stash for the same id."""
+    self._clear_pending_conversion(script_id)
+    self.pending_type_conversion[script_id] = stash
+
+  def _clear_pending_conversion(self, script_id: str) -> None:
+    """Discard a pending type-conversion stash and remove any staged temp directories."""
+    stash = self.pending_type_conversion.pop(script_id, None)
+    if not stash:
+      return
+    staged = stash.get("staged_root")
+    if staged:
+      shutil.rmtree(staged, ignore_errors=True)
+
+  # --- rollback ---------------------------------------------------------------
+
   async def rollback_to(self, script_id: str, ts: str) -> str:
+    """Roll back to a previous version.
+
+    The target version's "kind" field (written by snapshot_current_version /
+    snapshot_current_app_version) determines the restore strategy, NOT the
+    current type.  This means rolling back past a type-conversion (e.g.
+    script → project) fully reverts the type as well — including removing the
+    new type's artifacts and restoring the old type's files and meta.
+
+    Versions created before this migration have no "kind" tag; we fall back to
+    inferring it from the file extension (.py ⇒ script, .tar.gz ⇒ app).
+    """
     script = self.get_script(script_id)
     if not script:
       return "❌ Script not found."
-
-    if script.get("type", "script") != "script":
-      return await self._rollback_app_to(script_id, ts)
-
-    versions = self.get_versions(script_id)
-    chosen = None
-    for v in versions:
-      if v["ts"] == ts:
-        chosen = v
-        break
-    if not chosen:
-      return "❌ Version not found."
-
-    version_path = Path(chosen["file"])
-    if not version_path.exists():
-      return "❌ Version file missing on disk."
-
-    # Read the target version's bytes NOW. Snapshotting the current file below can (in rare
-    # cases, e.g. same-second timestamps) reuse this exact file name - reading it into memory
-    # first guarantees we always restore the content the user actually picked.
-    version_bytes = version_path.read_bytes()
-
-    was_running = self.script_running(script_id)
-    if was_running:
-      await self.stop_script(script_id)
-
-    # Snapshot current before rollback
-    if self.script_file_path(script_id).exists():
-      self.snapshot_current_version(script_id)
-
-    # Replace current script with chosen version
-    try:
-      self.script_file_path(script_id).write_bytes(version_bytes)
-    except Exception:
-      logger.exception("Rollback copy failed for %s", script_id)
-      return "❌ Rollback failed (copy error)."
-
-    # Update updated_at
-    script = self.get_script(script_id)
-    if script:
-      script["updated_at"] = now_ts_str()
-      self.save_meta()
-
-    msg = f"⏪ Rolled back *{script_id}* to version {pretty_dt_from_ts(ts)}".replace("*", "")
-
-    if was_running:
-      s = await self.start_script(script_id)
-      msg += f"\n{s}"
-
-    return msg
-
-  async def _rollback_app_to(self, script_id: str, ts: str) -> str:
-    script = self.get_script(script_id)
-    if not script:
-      return "❌ App not found."
 
     versions = self.get_versions(script_id)
     chosen = next((v for v in versions if v["ts"] == ts), None)
@@ -1172,49 +1235,108 @@ class ScriptManager:
     if not version_path.exists():
       return "❌ Version file missing on disk."
 
-    root = Path(script.get("root_dir") or self.app_root_dir(script_id))
+    # Infer target kind from the version tag, falling back to the file extension
+    # for versions created before this migration.
+    target_kind: str = chosen.get("kind") or ("script" if version_path.suffix == ".py" else "app")
+    current_type = script.get("type", "script")
+    current_kind = "script" if current_type == "script" else "app"
 
-    # Extract the target version into a temp dir FIRST (before snapshotting current, which
-    # could in rare cases - e.g. same-second timestamps - reuse this exact archive's file name).
-    tmp_extract = root.parent / f"__rollback_tmp_{script_id}"
-    shutil.rmtree(tmp_extract, ignore_errors=True)
-    try:
-      with tarfile.open(version_path, "r:gz") as tf:
-        tf.extractall(tmp_extract, filter="data")
-    except Exception:
-      logger.exception("App rollback extract failed for %s", script_id)
+    # --- Stage the restore data BEFORE snapshotting to avoid same-second
+    # timestamp collisions (reading/extracting now guarantees the chosen version
+    # is unaffected by the snapshot we're about to create).
+    if target_kind == "script":
+      version_bytes = version_path.read_bytes()
+      tmp_extract = None
+    else:
+      tmp_extract = self.app_root_dir(script_id).parent / f"__rollback_tmp_{script_id}"
       shutil.rmtree(tmp_extract, ignore_errors=True)
-      return "❌ Rollback failed (extract error)."
+      try:
+        with tarfile.open(version_path, "r:gz") as tf:
+          tf.extractall(tmp_extract, filter="data")
+      except Exception:
+        logger.exception("App rollback extract failed for %s", script_id)
+        shutil.rmtree(tmp_extract, ignore_errors=True)
+        return "❌ Rollback failed (extract error)."
 
     was_running = self.script_running(script_id)
     if was_running:
       await self.stop_script(script_id)
 
-    # Snapshot current before rollback
-    if root.exists():
-      self.snapshot_current_app_version(script_id)
+    # Snapshot current state so this rollback is itself re-revertible.
+    if current_kind == "script":
+      if self.script_file_path(script_id).exists():
+        self.snapshot_current_version(script_id)
+    else:
+      cur_root = Path(script.get("root_dir") or self.app_root_dir(script_id))
+      if cur_root.exists():
+        self.snapshot_current_app_version(script_id)
 
-    try:
-      inner = tmp_extract / script_id
-      if not inner.exists():
-        inner = tmp_extract  # be defensive about older/foreign archives
+    # When crossing a type boundary, remove the artifacts of the current type.
+    if current_kind != target_kind:
+      self._clear_type_artifacts(script_id, script, target_kind)
 
-      shutil.rmtree(root, ignore_errors=True)
-      root.mkdir(parents=True, exist_ok=True)
-      for item in inner.iterdir():
-        shutil.move(str(item), str(root / item.name))
-    except Exception:
-      logger.exception("App rollback failed for %s", script_id)
-      return "❌ Rollback failed (move error)."
-    finally:
-      shutil.rmtree(tmp_extract, ignore_errors=True)
+    # --- Materialize the target version ------------------------------------
+    if target_kind == "script":
+      try:
+        dest_py = self.script_file_path(script_id)
+        dest_py.parent.mkdir(parents=True, exist_ok=True)
+        dest_py.write_bytes(version_bytes)
+      except Exception:
+        logger.exception("Rollback copy failed for %s", script_id)
+        return "❌ Rollback failed (copy error)."
 
-    script = self.get_script(script_id)
-    if script:
-      script["updated_at"] = now_ts_str()
-      self.save_meta()
+      script["type"] = "script"
+      script["file"] = str(self.script_file_path(script_id))
+      for k in ("root_dir", "venv_dir", "entry", "git"):
+        script.pop(k, None)
 
-    msg = f"⏪ Rolled back {script_id} to version {pretty_dt_from_ts(ts)}"
+    else:
+      target_app_type: str = chosen.get("app_type") or (current_type if current_type != "script" else "project")
+      target_git: Optional[Dict[str, Any]] = chosen.get("git")
+      dest_root = self.app_root_dir(script_id)
+
+      try:
+        assert tmp_extract is not None
+        inner = tmp_extract / script_id
+        if not inner.exists():
+          inner = tmp_extract  # older/foreign archives without the wrapper dir
+
+        shutil.rmtree(dest_root, ignore_errors=True)
+        dest_root.mkdir(parents=True, exist_ok=True)
+        for item in inner.iterdir():
+          shutil.move(str(item), str(dest_root / item.name))
+      except Exception:
+        logger.exception("App rollback failed for %s", script_id)
+        return "❌ Rollback failed (move error)."
+      finally:
+        if tmp_extract is not None:
+          shutil.rmtree(tmp_extract, ignore_errors=True)
+
+      py_files = discover_python_files(dest_root)
+      entry, _ = pick_entry_from_candidates(py_files)
+
+      venv_dir = self.app_venv_dir(script_id)
+      venv_ok, venv_out = await create_venv(venv_dir)
+      if not venv_ok:
+        logger.error("Venv creation failed during rollback for %s: %s", script_id, safe_trim_text(venv_out, 500))
+
+      script["type"] = target_app_type
+      script["root_dir"] = str(dest_root)
+      script["venv_dir"] = str(venv_dir)
+      script["entry"] = entry
+      if target_git:
+        script["git"] = target_git
+      else:
+        script.pop("git", None)
+      script.pop("file", None)
+
+    script["updated_at"] = now_ts_str()
+    self.save_meta()
+
+    type_label = {"script": "📄 script", "project": "📦 archive app", "git": "🌐 GitHub app"}.get(
+        script.get("type", "script"), script.get("type", "script")
+    )
+    msg = f"⏪ Rolled back {script_id} to version {pretty_dt_from_ts(ts)} ({type_label})"
 
     if was_running:
       s = await self.start_script(script_id)
@@ -1398,6 +1520,9 @@ def script_menu_keyboard(script_id: str) -> InlineKeyboardMarkup:
       InlineKeyboardButton(auto_text, callback_data=f"auto:{script_id}"),
     ],
     [
+      InlineKeyboardButton("🔀 Change Source", callback_data=f"changesrc:{script_id}"),
+    ],
+    [
       InlineKeyboardButton("⬅ Back", callback_data="back:main"),
     ],
   ]
@@ -1434,6 +1559,9 @@ def app_menu_keyboard(script_id: str) -> InlineKeyboardMarkup:
       InlineKeyboardButton(auto_text, callback_data=f"auto:{script_id}"),
     ],
     [
+      InlineKeyboardButton("🔀 Change Source", callback_data=f"changesrc:{script_id}"),
+    ],
+    [
       InlineKeyboardButton("⬅ Back", callback_data="back:main"),
     ],
   ]
@@ -1443,6 +1571,53 @@ def app_menu_keyboard(script_id: str) -> InlineKeyboardMarkup:
 def menu_keyboard_for(script_id: str) -> InlineKeyboardMarkup:
   app_type = script_mgr.get_type(script_id)
   return script_menu_keyboard(script_id) if app_type == "script" else app_menu_keyboard(script_id)
+
+
+_TYPE_LABEL: Dict[str, str] = {
+    "script": "📄 script",
+    "project": "📦 archive app",
+    "git": "🌐 GitHub app",
+}
+
+
+def _source_change_confirm_text(script_id: str, old_type: str, new_type: str) -> str:
+  """Confirmation message for any source-change operation initiated via the
+  'Change Source' button.  Uses the full conversion warning when the type
+  changes, or a shorter replace-only note when the type stays the same."""
+  if old_type != new_type:
+    return type_conversion_confirm_text(script_id, old_type, new_type)
+  label = _TYPE_LABEL.get(old_type, old_type)
+  return (
+      f"🔀 Replace the source of {script_id} ({label})?\n\n"
+      f"• The current version will be saved — reachable via ⏪ Rollback\n"
+      f"• All env vars and autostart settings are preserved\n\n"
+      f"Continue?"
+  )
+
+
+def type_conversion_confirm_text(script_id: str, old_type: str, new_type: str) -> str:
+  old_label = _TYPE_LABEL.get(old_type, old_type)
+  new_label = _TYPE_LABEL.get(new_type, new_type)
+  if old_type == "script":
+    cleanup_note = "set up a new isolated virtual environment"
+  else:
+    cleanup_note = "remove the existing source tree and virtual environment"
+  return (
+      f"⚠️ {script_id} is currently a {old_label}.\n\n"
+      f"Converting to a {new_label} will:\n"
+      f"• Stop the app if it is running\n"
+      f"• Replace its files and {cleanup_note}\n"
+      f"• Keep all old versions reachable via ⏪ Rollback, including a full "
+      f"revert back to {old_label} mode\n\n"
+      f"Continue?"
+  )
+
+
+def type_conversion_confirm_keyboard(script_id: str) -> InlineKeyboardMarkup:
+  return InlineKeyboardMarkup([[
+      InlineKeyboardButton("✅ Convert", callback_data=f"convtype:yes:{script_id}"),
+      InlineKeyboardButton("❌ Cancel", callback_data=f"convtype:no:{script_id}"),
+  ]])
 
 
 def env_menu_text(script_id: str) -> str:
@@ -1568,9 +1743,16 @@ async def present_setup_result(
   await send_app_menu(chat_id, script_id, context)
 
 
-async def handle_archive_upload(update: Update, context: ContextTypes.DEFAULT_TYPE, doc) -> None:
+async def handle_archive_upload(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+    doc,
+    force_target_id: Optional[str] = None,
+) -> None:
   filename = doc.file_name
-  app_id = sanitize_id(strip_archive_ext(filename))
+  # When arriving via "Change Source", the user may have sent an archive whose
+  # filename doesn't match the target app's id — honour the override.
+  app_id = force_target_id or sanitize_id(strip_archive_ext(filename))
 
   status_msg = await update.message.reply_text(f"📦 Downloading {filename} ...")
   tmp_archive = TMP_DIR / f"upload_{app_id}_{int(datetime.now().timestamp())}{archive_ext_of(filename)}"
@@ -1591,6 +1773,27 @@ async def handle_archive_upload(update: Update, context: ContextTypes.DEFAULT_TY
 
     extraction_root = find_extraction_root(staging)
 
+    old_type = script_mgr.conflicting_type(app_id, "project")
+    # Show confirmation if: (a) a different type already exists, or (b) the
+    # user explicitly requested a source change via the "Change Source" button.
+    needs_confirm = old_type is not None or force_target_id is not None
+    if needs_confirm:
+      effective_old_type = old_type or (script_mgr.get_script(app_id) or {}).get("type", "project")
+      script_mgr._set_pending_conversion(app_id, {
+          "action": "archive",
+          "staged_root": str(extraction_root),
+          "staging": str(staging) if staging != extraction_root else None,
+          "old_type": effective_old_type,
+      })
+      await status_msg.delete()
+      confirm_text = (
+          _source_change_confirm_text(app_id, effective_old_type, "project")
+          if force_target_id is not None
+          else type_conversion_confirm_text(app_id, effective_old_type, "project")
+      )
+      await update.message.reply_text(confirm_text, reply_markup=type_conversion_confirm_keyboard(app_id))
+      return
+
     await status_msg.edit_text(f"⚙️ Setting up app {app_id} ...")
     result = await script_mgr.setup_project_app(app_id, extraction_root, "project")
     if staging.exists() and staging != extraction_root:
@@ -1604,7 +1807,13 @@ async def handle_archive_upload(update: Update, context: ContextTypes.DEFAULT_TY
     tmp_archive.unlink(missing_ok=True)
 
 
-async def setup_git_app(info: Dict[str, Any]) -> Dict[str, Any]:
+async def _prepare_git_app(info: Dict[str, Any]) -> Dict[str, Any]:
+  """Clone / pull the repo and copy the relevant subtree to a staging directory.
+  Returns a dict with ``staged_root`` and ``git_info`` on success, or
+  ``{"status": "error", "message": ...}`` on failure.  Does NOT mutate the
+  ScriptManager; the caller decides whether to proceed immediately or first
+  show a confirmation dialog.
+  """
   app_id = info["app_id"]
   repo_dir = GITREPOS_DIR / app_id
   repo_url = f"https://github.com/{info['owner']}/{info['repo']}.git"
@@ -1630,9 +1839,7 @@ async def setup_git_app(info: Dict[str, Any]) -> Dict[str, Any]:
       "path": info.get("path"),
       "repo_dir": str(repo_dir),
   }
-  result = await script_mgr.setup_project_app(app_id, staging, "git", git_info)
-  result["app_id"] = app_id
-  return result
+  return {"staged_root": staging, "git_info": git_info, "app_id": app_id}
 
 
 async def sync_git_app(script_id: str) -> Dict[str, Any]:
@@ -1675,7 +1882,12 @@ async def sync_git_app(script_id: str) -> Dict[str, Any]:
   return result
 
 
-async def process_github_url(update: Update, context: ContextTypes.DEFAULT_TYPE, url: str) -> None:
+async def process_github_url(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+    url: str,
+    force_target_id: Optional[str] = None,
+) -> None:
   info = parse_github_url(url)
   if not info:
     await update.message.reply_text(
@@ -1685,16 +1897,47 @@ async def process_github_url(update: Update, context: ContextTypes.DEFAULT_TYPE,
     )
     return
 
+  # When the user arrives via "Change Source", override the app_id that would
+  # normally be inferred from the repository name.
+  if force_target_id:
+    info = {**info, "app_id": force_target_id}
+
+  app_id = info["app_id"]
   status_msg = await update.message.reply_text(f"🌐 Cloning {info['owner']}/{info['repo']} ...")
-  result = await setup_git_app(info)
+  prep = await _prepare_git_app(info)
   await status_msg.delete()
 
-  if result.get("status") == "error":
-    await update.message.reply_text(f"❌ Failed to import repo:\n{safe_trim_text(result.get('message', ''), 3500)}")
+  if prep.get("status") == "error":
+    await update.message.reply_text(f"❌ Failed to import repo:\n{safe_trim_text(prep.get('message', ''), 3500)}")
     return
 
+  staged_root: Path = prep["staged_root"]
+  git_info: Dict[str, Any] = prep["git_info"]
+
+  old_type = script_mgr.conflicting_type(app_id, "git")
+  # Show confirmation when: (a) a conflicting type exists, or (b) the user
+  # explicitly invoked "Change Source" (so we always confirm before replacing).
+  needs_confirm = old_type is not None or force_target_id is not None
+  if needs_confirm:
+    effective_old_type = old_type or (script_mgr.get_script(app_id) or {}).get("type", "git")
+    script_mgr._set_pending_conversion(app_id, {
+        "action": "git",
+        "staged_root": str(staged_root),
+        "git_info": git_info,
+        "old_type": effective_old_type,
+    })
+    confirm_text = (
+        _source_change_confirm_text(app_id, effective_old_type, "git")
+        if force_target_id is not None
+        else type_conversion_confirm_text(app_id, effective_old_type, "git")
+    )
+    await update.message.reply_text(confirm_text, reply_markup=type_conversion_confirm_keyboard(app_id))
+    return
+
+  result = await script_mgr.setup_project_app(app_id, staged_root, "git", git_info)
+  result["app_id"] = app_id
   await present_setup_result(
-      update.effective_chat.id, context, result["app_id"], result, f"✅ App {result['app_id']} cloned from GitHub."
+      update.effective_chat.id, context, app_id, result, f"✅ App {app_id} cloned from GitHub."
   )
 
 
@@ -1720,11 +1963,18 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
       "  (app name becomes repo-folder, e.g. myrepo-myapp)\n"
       "• Or use /repo <url>\n"
       "• These apps get a 🔄 Sync button: re-pulls the repo, offers to install new deps, and runs it\n\n"
+      "🔀 Switching an app's type / source:\n"
+      "• Upload a .py / archive / GitHub link whose name matches an existing app of a different type\n"
+      "• Or open an app's menu and press 🔀 Change Source, then send any source — even with a\n"
+      "  different filename or repo name.  The bot always asks for confirmation before replacing.\n"
+      "• All old versions are kept — ⏪ Rollback works across the type boundary and fully restores\n"
+      "  the previous type (files, venv, meta), so switching is always reversible\n\n"
       "Main:\n"
       "• /menu — apps/scripts menu\n"
       "• /list — list apps/scripts (rich)\n"
       "• /new <name> — create script from next text message\n"
       "• /repo <github_url> — import an app from a GitHub repo\n"
+      "• /cancel — abort any pending input flow (Change Source, /new, env edit, etc.)\n"
       "• /run <id>, /stop <id>\n"
       "• /logs <id>\n"
       "• /monitoring — CPU/MEM for running scripts\n\n"
@@ -1738,6 +1988,27 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
       "Legend: 📄 script  📦 archive app  🌐 GitHub app\n"
       "Tip: For /monitoring install psutil via /pip psutil"
   )
+
+
+async def cmd_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+  if not is_authorized(update):
+    return
+  user_id = update.effective_user.id
+  cleared: list[str] = []
+  if script_mgr.pending_source_change.pop(user_id, None) is not None:
+    cleared.append("source change")
+  if script_mgr.pending_new.pop(user_id, None) is not None:
+    cleared.append("new script")
+  if script_mgr.pending_edit.pop(user_id, None) is not None:
+    cleared.append("script edit")
+  if script_mgr.pending_env_value.pop(user_id, None) is not None:
+    cleared.append("env edit")
+  if script_mgr.pending_pip.pop(user_id, None) is not None:
+    cleared.append("pip install")
+  if cleared:
+    await update.message.reply_text(f"🚫 Cancelled: {', '.join(cleared)}.")
+  else:
+    await update.message.reply_text("🟡 Nothing to cancel.")
 
 
 async def cmd_menu(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -2051,6 +2322,19 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
   # new script flow
   if user_id in script_mgr.pending_new:
     script_id = script_mgr.pending_new.pop(user_id)
+    old_type = script_mgr.conflicting_type(script_id, "script")
+    if old_type is not None:
+      # Stash the text and wait for user confirmation.
+      script_mgr._set_pending_conversion(script_id, {
+          "action": "script_text",
+          "text": text,
+          "old_type": old_type,
+      })
+      await update.message.reply_text(
+          type_conversion_confirm_text(script_id, old_type, "script"),
+          reply_markup=type_conversion_confirm_keyboard(script_id),
+      )
+      return
     full_id = script_mgr.upsert_script_from_text(script_id, text)
     await update.message.reply_text(f"✅ Script {full_id} saved.")
     await send_script_menu(update.effective_chat.id, full_id, context)
@@ -2071,6 +2355,27 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     await send_env_menu(update.effective_chat.id, script_id, context)
     return
 
+  # "Change Source" flow — the user previously clicked the button and we are
+  # now waiting for the new source.  Only GitHub links are accepted as text;
+  # files / archives must be sent as documents (handled in handle_document).
+  if user_id in script_mgr.pending_source_change:
+    target_id = script_mgr.pending_source_change[user_id]
+    gh_info = parse_github_url(text.strip())
+    if gh_info:
+      del script_mgr.pending_source_change[user_id]
+      await process_github_url(update, context, text.strip(), force_target_id=target_id)
+    else:
+      await update.message.reply_text(
+          f"❓ Waiting for a new source for *{target_id}*.\n\n"
+          "Send:\n"
+          "• A `.py` file — convert to 📄 script\n"
+          "• An archive (`.zip` / `.tar.gz` / `.tgz` / `.tar` / `.7z`) — convert to 📦 archive app\n"
+          "• A GitHub link — convert to 🌐 GitHub app\n\n"
+          "Send /cancel to abort.",
+          parse_mode="Markdown",
+      )
+    return
+
   # GitHub repo link, sent as a plain message (only if no other flow matched above)
   gh_info = parse_github_url(text.strip())
   if gh_info:
@@ -2087,26 +2392,65 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
   filename = doc.file_name or "file"
   lower = filename.lower()
 
+  user_id = update.effective_user.id
+  # If the user clicked "Change Source", honour the stored target app id
+  # regardless of what the uploaded file is named.
+  force_target_id: Optional[str] = script_mgr.pending_source_change.pop(user_id, None)
+
   if lower.endswith(".py"):
+    if force_target_id:
+      script_id = force_target_id
+    else:
+      stem = Path(filename).stem.strip().replace(" ", "_")
+      script_id = stem or "script"
+    old_type = script_mgr.conflicting_type(script_id, "script")
+
     tmp_path = SCRIPTS_DIR / ("_upload_tmp_" + filename)
     file = await doc.get_file()
     await file.download_to_drive(str(tmp_path))
-
-    script_id = script_mgr.upsert_script_from_file(filename, tmp_path)
+    file_bytes = tmp_path.read_bytes()
     tmp_path.unlink(missing_ok=True)
 
-    await update.message.reply_text(f"✅ Script {script_id} saved from file.\n📦 Version saved (if it overwrote existing script).")
-    await send_app_menu(update.effective_chat.id, script_id, context)
-    await send_env_menu(update.effective_chat.id, script_id, context)
+    needs_confirm = old_type is not None or force_target_id is not None
+    if needs_confirm:
+      effective_old_type = old_type or (script_mgr.get_script(script_id) or {}).get("type", "script")
+      script_mgr._set_pending_conversion(script_id, {
+          "action": "script_file",
+          "file_bytes": file_bytes,
+          "original_name": filename,
+          "old_type": effective_old_type,
+      })
+      confirm_text = (
+          _source_change_confirm_text(script_id, effective_old_type, "script")
+          if force_target_id is not None
+          else type_conversion_confirm_text(script_id, effective_old_type, "script")
+      )
+      await update.message.reply_text(confirm_text, reply_markup=type_conversion_confirm_keyboard(script_id))
+      return
+
+    # Write bytes to a temp file so upsert_script_from_file can read it.
+    tmp_path2 = SCRIPTS_DIR / ("_upload_tmp2_" + filename)
+    tmp_path2.write_bytes(file_bytes)
+    actual_id = script_mgr.upsert_script_from_file(filename, tmp_path2)
+    tmp_path2.unlink(missing_ok=True)
+
+    await update.message.reply_text(f"✅ Script {actual_id} saved from file.\n📦 Version saved (if it overwrote existing script).")
+    await send_app_menu(update.effective_chat.id, actual_id, context)
+    await send_env_menu(update.effective_chat.id, actual_id, context)
     return
 
   if lower.endswith(ARCHIVE_EXTENSIONS):
-    await handle_archive_upload(update, context, doc)
+    await handle_archive_upload(update, context, doc, force_target_id=force_target_id)
     return
+
+  if force_target_id:
+    # Restore so the next message can still trigger a source change
+    script_mgr.pending_source_change[user_id] = force_target_id
 
   await update.message.reply_text(
       "❌ Unsupported file type.\n"
-      "Send a .py file, or an archive: .zip / .tar.gz / .tgz / .tar / .7z"
+      "Send a .py file, or an archive: .zip / .tar.gz / .tgz / .tar / .7z\n"
+      "Send /cancel to abort."
   )
 
 
@@ -2330,6 +2674,107 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     await query.edit_message_text(run_msg, reply_markup=menu_keyboard_for(script_id))
     return
 
+  if data.startswith("changesrc:"):
+    # changesrc:<script_id> — user clicked "Change Source" from the app menu
+    script_id = data.split(":", 1)[1]
+    if not script_mgr.get_script(script_id):
+      await query.edit_message_text("❌ App not found.")
+      return
+    user_id = query.from_user.id
+    # Clear any other pending user-scoped states so we don't mix flows.
+    script_mgr.pending_new.pop(user_id, None)
+    script_mgr.pending_edit.pop(user_id, None)
+    script_mgr.pending_env_value.pop(user_id, None)
+    script_mgr.pending_pip.pop(user_id, None)
+    script_mgr.pending_source_change[user_id] = script_id
+    await query.edit_message_text(
+        f"🔀 *{script_id}* — waiting for new source.\n\n"
+        "Send:\n"
+        "• A `.py` file → convert to 📄 script\n"
+        "• An archive (`.zip` / `.tar.gz` / `.tgz` / `.tar` / `.7z`) → convert to 📦 archive app\n"
+        "• A GitHub link → convert to 🌐 GitHub app\n\n"
+        "Send /cancel to abort.",
+        parse_mode="Markdown",
+    )
+    return
+
+  if data.startswith("convtype:"):
+    # convtype:<yes|no>:<script_id>
+    parts = data.split(":", 2)
+    if len(parts) != 3:
+      return
+    _, action, script_id = parts
+    chat_id = query.message.chat_id
+
+    if action == "no":
+      script_mgr._clear_pending_conversion(script_id)
+      await query.edit_message_text(f"🚫 Conversion of {script_id} cancelled.")
+      return
+
+    if action == "yes":
+      stash = script_mgr.pending_type_conversion.pop(script_id, None)
+      if not stash:
+        await query.edit_message_text("❌ Conversion request expired or already executed.")
+        return
+
+      # Stop the running process before mutating the on-disk state.
+      if script_mgr.script_running(script_id):
+        await script_mgr.stop_script(script_id)
+
+      stash_action = stash.get("action")
+
+      if stash_action == "archive":
+        staged_root = Path(stash["staged_root"])
+        if not staged_root.exists():
+          await query.edit_message_text("❌ Staged archive expired. Please re-upload the file.")
+          return
+        await query.edit_message_text(f"⚙️ Converting {script_id} to archive app ...")
+        result = await script_mgr.setup_project_app(script_id, staged_root, "project")
+        # Clean up any outer staging wrapper that might still exist.
+        outer = stash.get("staging")
+        if outer:
+          shutil.rmtree(outer, ignore_errors=True)
+        await query.delete()
+        await present_setup_result(chat_id, context, script_id, result, f"✅ {script_id} converted to archive app.")
+
+      elif stash_action == "git":
+        staged_root = Path(stash["staged_root"])
+        if not staged_root.exists():
+          await query.edit_message_text("❌ Staged repo expired. Please re-send the GitHub link.")
+          return
+        git_info: Dict[str, Any] = stash["git_info"]
+        await query.edit_message_text(f"⚙️ Converting {script_id} to GitHub app ...")
+        result = await script_mgr.setup_project_app(script_id, staged_root, "git", git_info)
+        result["app_id"] = script_id
+        await query.delete()
+        await present_setup_result(chat_id, context, script_id, result, f"✅ {script_id} converted to GitHub app.")
+
+      elif stash_action == "script_text":
+        text_body: str = stash["text"]
+        await query.edit_message_text(f"⚙️ Converting {script_id} to script ...")
+        full_id = script_mgr.upsert_script_from_text(script_id, text_body)
+        await query.edit_message_text(f"✅ {full_id} converted to script.")
+        await send_script_menu(chat_id, full_id, context)
+        await send_env_menu(chat_id, full_id, context)
+
+      elif stash_action == "script_file":
+        original_name: str = stash["original_name"]
+        file_bytes: bytes = stash["file_bytes"]
+        tmp_conv = TMP_DIR / f"_conv_{script_id}_{int(datetime.now().timestamp())}.py"
+        tmp_conv.write_bytes(file_bytes)
+        try:
+          await query.edit_message_text(f"⚙️ Converting {script_id} to script ...")
+          full_id = script_mgr.upsert_script_from_file(original_name, tmp_conv)
+        finally:
+          tmp_conv.unlink(missing_ok=True)
+        await query.edit_message_text(f"✅ {full_id} converted to script.")
+        await send_script_menu(chat_id, full_id, context)
+        await send_env_menu(chat_id, full_id, context)
+
+      else:
+        await query.edit_message_text("❌ Unknown conversion action.")
+      return
+
   if data.startswith("sync:"):
     script_id = data.split(":", 1)[1]
     script = script_mgr.get_script(script_id)
@@ -2386,6 +2831,7 @@ def main() -> None:
   application = Application.builder().token(BOT_TOKEN).post_init(on_startup).build()
 
   application.add_handler(CommandHandler("start", cmd_start))
+  application.add_handler(CommandHandler("cancel", cmd_cancel))
   application.add_handler(CommandHandler("menu", cmd_menu))
   application.add_handler(CommandHandler("list", cmd_list))
   application.add_handler(CommandHandler("new", cmd_new))

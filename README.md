@@ -21,6 +21,10 @@ Designed for **single-owner** usage (restricted by `OWNER_ID`).
     name = `repo-subdir`
   - **🔄 Sync** button re-pulls the repo, offers to install any new dependencies,
     and restarts the app
+- **🔀 Switching an app's type**: upload a `.py` file / archive / GitHub link whose name matches
+  an existing app of a **different** type — the bot will ask for confirmation before converting.
+  All old versions are preserved and ⏪ Rollback works across the type boundary, fully restoring
+  the previous type (source files, virtual environment, metadata), so switching is always reversible.
 - **🧪 ENV**: global env + per-script/app env, optional env key detection from code
   (scans all `.py` files for apps, same detection logic as before for scripts)
 - **🚀 Autostart**: run selected scripts/apps automatically when the manager starts
@@ -114,6 +118,16 @@ docker compose down
   - `https://github.com/owner/repo`
   - `https://github.com/owner/repo/tree/main/subdir`
 - Legend in menus: `📄` script · `📦` archive app · `🌐` GitHub app.
+
+### Switching an app's type
+Upload a `.py` file, an archive, or a GitHub link whose **name resolves to the same id** as an
+existing app of a different type:
+- The bot shows a confirmation dialog (`✅ Convert` / `❌ Cancel`) before doing anything.
+- On confirmation: the running process is stopped, old-type artifacts (source tree, venv, `.py`
+  file) are removed, and the new type is set up from scratch.
+- **All previous versions are kept.** ⏪ Rollback works across the type boundary — choosing a
+  version from before the conversion fully restores the old type (source files, virtual environment,
+  and all metadata). The conversion itself is also snapshotted, so it too is reversible.
 
 ---
 
