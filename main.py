@@ -377,12 +377,32 @@ def find_requirements_pkgs(root: Path) -> List[str]:
     return []
 
 
-def pick_entry_from_candidates(py_files: List[str]) -> Tuple[Optional[str], bool]:
-  """Returns (entry_or_None, ambiguous)."""
+def pick_entry_from_candidates(
+    py_files: List[str],
+    name_hints: Optional[List[str]] = None,
+) -> Tuple[Optional[str], bool]:
+  """Returns (entry_or_None, ambiguous).
+
+  Auto-detection rules, in order:
+  1. A file literally named main.py (shallowest one wins).
+  2. A file whose name (without .py) matches one of ``name_hints`` — e.g. the
+     app id, the repo name, or the (sub)folder name — since projects often
+     name their entry script after the project itself (e.g. myapp/myapp.py).
+  3. If there's exactly one .py file at all, that one.
+  Otherwise it's ambiguous and the caller should ask the user.
+  """
   mains = [f for f in py_files if Path(f).name.lower() == "main.py"]
   if mains:
     mains.sort(key=lambda p: p.count("/"))
     return mains[0], False
+
+  hints = {h.strip().lower() for h in (name_hints or []) if h and h.strip()}
+  if hints:
+    named = [f for f in py_files if Path(f).stem.lower() in hints]
+    if named:
+      named.sort(key=lambda p: p.count("/"))
+      return named[0], False
+
   if len(py_files) == 1:
     return py_files[0], False
   if len(py_files) == 0:
@@ -735,13 +755,29 @@ class ScriptManager:
       # Remove artifacts that belong exclusively to the old type.
       self._clear_type_artifacts(script_id, existing, "app")
 
+    extracted_root_name = extracted_root.name
     if dest_root.exists():
       shutil.rmtree(dest_root, ignore_errors=True)
     dest_root.parent.mkdir(parents=True, exist_ok=True)
     shutil.move(str(extracted_root), str(dest_root))
 
     py_files = discover_python_files(dest_root)
-    entry, ambiguous = pick_entry_from_candidates(py_files)
+    name_hints = [script_id, extracted_root_name]
+    if git_info:
+      name_hints.append(git_info.get("repo"))
+      if git_info.get("path"):
+        name_hints.append(Path(git_info["path"]).name)
+    entry, ambiguous = pick_entry_from_candidates(py_files, name_hints)
+
+    # Preserve a previously confirmed entry point (auto-detected or manually
+    # chosen from an ambiguous list) across re-syncs / re-uploads. Without
+    # this, re-running auto-detection on every sync can flip back to
+    # "ambiguous" (e.g. the repo has several top-level .py files and no
+    # main.py) and force the user to re-pick even though nothing meaningful
+    # about the entry point actually changed.
+    prev_entry = (existing or {}).get("entry")
+    if prev_entry and prev_entry in py_files:
+      entry, ambiguous = prev_entry, False
 
     venv_dir = self.app_venv_dir(script_id)
     venv_ok, venv_out = await create_venv(venv_dir)
@@ -766,6 +802,9 @@ class ScriptManager:
       result["status"] = "ambiguous"
       result["candidates"] = py_files
     else:
+      # A stale pending choice from a previous ambiguous setup (now resolved,
+      # e.g. via a preserved entry) would otherwise dangle around forever.
+      self.pending_entry_choice.pop(script_id, None)
       result["status"] = "ready"
       result["entry"] = entry
     return result
@@ -1386,7 +1425,12 @@ class ScriptManager:
           shutil.rmtree(tmp_extract, ignore_errors=True)
 
       py_files = discover_python_files(dest_root)
-      entry, ambiguous = pick_entry_from_candidates(py_files)
+      name_hints = [script_id]
+      if target_git:
+        name_hints.append(target_git.get("repo"))
+        if target_git.get("path"):
+          name_hints.append(Path(target_git["path"]).name)
+      entry, ambiguous = pick_entry_from_candidates(py_files, name_hints)
       # If the snapshotted version recorded a confirmed entry point (set when the
       # owner chose from an ambiguous list), honour it instead of re-running
       # auto-detection — which can return None for multi-file apps and break

@@ -73,6 +73,38 @@ def test_pick_entry_no_files(app):
   assert ambiguous is False
 
 
+def test_pick_entry_matches_name_hint_when_no_main_py(app):
+  entry, ambiguous = app.pick_entry_from_candidates(
+      ["utils.py", "myrepo.py"], name_hints=["myrepo"]
+  )
+  assert entry == "myrepo.py"
+  assert ambiguous is False
+
+
+def test_pick_entry_name_hint_is_case_insensitive(app):
+  entry, ambiguous = app.pick_entry_from_candidates(
+      ["utils.py", "MyRepo.py"], name_hints=["myrepo"]
+  )
+  assert entry == "MyRepo.py"
+  assert ambiguous is False
+
+
+def test_pick_entry_main_py_still_wins_over_name_hint(app):
+  entry, ambiguous = app.pick_entry_from_candidates(
+      ["myrepo.py", "main.py"], name_hints=["myrepo"]
+  )
+  assert entry == "main.py"
+  assert ambiguous is False
+
+
+def test_pick_entry_still_ambiguous_when_hint_does_not_match(app):
+  entry, ambiguous = app.pick_entry_from_candidates(
+      ["a.py", "b.py"], name_hints=["myrepo"]
+  )
+  assert entry is None
+  assert ambiguous is True
+
+
 # --- GitHub URL parsing -------------------------------------------------------
 
 def test_parse_github_url_plain_repo(app):

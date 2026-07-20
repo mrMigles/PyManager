@@ -54,6 +54,49 @@ async def test_setup_project_app_ambiguous_without_main_py(script_mgr, fast_venv
 
 
 @pytest.mark.asyncio
+async def test_setup_project_app_selects_entry_matching_app_id(script_mgr, fast_venv, tmp_path):
+  # No main.py, and no way to auto-select by "only one file" - but one of the
+  # files is named after the app itself (the archive/repo name), which should
+  # be treated as the entry point automatically.
+  staging = _write_project(tmp_path / "staging", {
+      "utils.py": "x = 1\n",
+      "demo.py": "print('hi')\n",
+  })
+  result = await script_mgr.setup_project_app("demo", staging, "project")
+  assert result["status"] == "ready"
+  assert result["entry"] == "demo.py"
+
+
+@pytest.mark.asyncio
+async def test_reupload_preserves_manually_chosen_entry_when_still_ambiguous(script_mgr, fast_venv, tmp_path):
+  """Regression: re-uploading/syncing an app that has several top-level .py
+  files and no main.py used to re-trigger the "which file is the entry
+  point?" prompt on every single sync, forgetting the choice the user had
+  already made."""
+  staging1 = _write_project(tmp_path / "s1", {
+      "a.py": "x = 1\n",
+      "b.py": "x = 2\n",
+  })
+  result1 = await script_mgr.setup_project_app("demo", staging1, "project")
+  assert result1["status"] == "ambiguous"
+
+  script = script_mgr.get_script("demo")
+  script["entry"] = "b.py"
+  script_mgr.save_meta()
+
+  staging2 = _write_project(tmp_path / "s2", {
+      "a.py": "x = 1\n",
+      "b.py": "x = 3\n",
+  })
+  result2 = await script_mgr.setup_project_app("demo", staging2, "project")
+
+  assert result2["status"] == "ready"
+  assert result2["entry"] == "b.py"
+  assert script_mgr.get_script("demo")["entry"] == "b.py"
+  assert "demo" not in script_mgr.pending_entry_choice
+
+
+@pytest.mark.asyncio
 async def test_setup_project_app_detects_requirements(script_mgr, fast_venv, tmp_path):
   staging = _write_project(tmp_path / "staging", {
       "main.py": "print('hi')\n",
