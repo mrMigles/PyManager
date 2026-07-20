@@ -25,6 +25,7 @@ import sys
 import json
 import re
 import shlex
+import string
 import asyncio
 import logging
 import shutil
@@ -34,6 +35,8 @@ from pathlib import Path
 from typing import Dict, Any, Optional, List, Tuple
 from collections import deque
 from datetime import datetime
+
+import pgdb
 
 from telegram import Update, InlineKeyboardMarkup, InlineKeyboardButton
 from telegram.ext import (
@@ -155,6 +158,22 @@ def extract_env_keys(source: str) -> set[str]:
     for m in re.findall(pat, source):
       keys.add(m)
   return keys
+
+
+def expand_env_values(values: Dict[str, str], base: Dict[str, str]) -> Dict[str, str]:
+  """Expand $VAR / ${VAR} references in *values* using *base* as the lookup.
+
+  Unknown references are left untouched (safe_substitute).  This lets users
+  write e.g. ``PG_USER=${PG_USERNAME}`` in their per-app env and have it
+  resolve to the injected Postgres username at runtime.
+  """
+  result: Dict[str, str] = {}
+  for k, v in values.items():
+    try:
+      result[k] = string.Template(v).safe_substitute(base)
+    except Exception:
+      result[k] = v
+  return result
 
 
 def read_text_file(path: Path) -> str:
@@ -1008,7 +1027,8 @@ class ScriptManager:
 
     env = os.environ.copy()
     env.update(self.meta.get("global_env", {}))
-    env.update(script.get("env", {}))
+    env.update(pgdb.app_pg_env(script_id))
+    env.update(expand_env_values(script.get("env", {}), env))
 
     log_file = self.log_path(script_id)
     log_file.parent.mkdir(parents=True, exist_ok=True)
@@ -1521,6 +1541,7 @@ def script_menu_keyboard(script_id: str) -> InlineKeyboardMarkup:
   stop_text = "⏹ Stop"
   auto_text = "🚀 Autostart: ON" if autostart else "⏸️ Autostart: OFF"
 
+  db_label = "🗄 Database Info" if pgdb.get_app_database(script_id) else "🗄 Create Database"
   buttons = [
     [
       InlineKeyboardButton(run_text, callback_data=f"run:{script_id}"),
@@ -1540,6 +1561,9 @@ def script_menu_keyboard(script_id: str) -> InlineKeyboardMarkup:
     ],
     [
       InlineKeyboardButton("🔀 Change Source", callback_data=f"changesrc:{script_id}"),
+    ],
+    [
+      InlineKeyboardButton(db_label, callback_data=f"createdb:{script_id}"),
     ],
     [
       InlineKeyboardButton("⬅ Back", callback_data="back:main"),
@@ -1563,6 +1587,7 @@ def app_menu_keyboard(script_id: str) -> InlineKeyboardMarkup:
   if app_type == "git":
     logs_row.append(InlineKeyboardButton("🔄 Sync", callback_data=f"sync:{script_id}"))
 
+  db_label = "🗄 Database Info" if pgdb.get_app_database(script_id) else "🗄 Create Database"
   buttons = [
     [
       InlineKeyboardButton(run_text, callback_data=f"run:{script_id}"),
@@ -1579,6 +1604,9 @@ def app_menu_keyboard(script_id: str) -> InlineKeyboardMarkup:
     ],
     [
       InlineKeyboardButton("🔀 Change Source", callback_data=f"changesrc:{script_id}"),
+    ],
+    [
+      InlineKeyboardButton(db_label, callback_data=f"createdb:{script_id}"),
     ],
     [
       InlineKeyboardButton("⬅ Back", callback_data="back:main"),
@@ -2849,6 +2877,52 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
       await context.bot.send_message(chat_id=query.message.chat_id, text=safe_trim_text("\n".join(lines), 3500))
 
     await send_app_menu(query.message.chat_id, script_id, context)
+    return
+
+  if data.startswith("createdb:"):
+    script_id = data.split(":", 1)[1]
+    if not script_mgr.get_script(script_id):
+      await query.edit_message_text("❌ Script not found.")
+      return
+
+    if not pgdb.pg_enabled():
+      await query.edit_message_text(
+          "❌ Postgres is not configured.\n"
+          "Set PG_ADMIN_PASSWORD (and optionally PG_ADMIN_USER) in your environment.",
+          reply_markup=menu_keyboard_for(script_id),
+      )
+      return
+
+    await query.edit_message_text("⏳ Provisioning database ...")
+    loop = asyncio.get_event_loop()
+    try:
+      row = await loop.run_in_executor(None, pgdb.provision_database, script_id)
+    except Exception as exc:
+      logger.exception("Database provisioning failed for app %s", script_id)
+      await context.bot.send_message(
+          chat_id=query.message.chat_id,
+          text=f"❌ Failed to provision database:\n{exc}",
+          reply_markup=menu_keyboard_for(script_id),
+      )
+      return
+
+    info = (
+        f"🗄 Database provisioned for *{script_id}*\n\n"
+        f"• `PG_DATABASE` = `{row['db_name']}`\n"
+        f"• `PG_USERNAME` = `{row['username']}`\n"
+        f"• `PG_PASSWORD` = `{row['password']}`\n"
+        f"• `PG_HOST` = `{pgdb._APP_HOST}`\n"
+        f"• `PG_PORT` = `{pgdb._APP_PORT}`\n\n"
+        f"These are injected automatically when the app runs.\n"
+        f"You can reference them in your app's Env vars, e.g.:\n"
+        f"`DATABASE_URL=postgresql://${{PG_USERNAME}}:${{PG_PASSWORD}}@${{PG_HOST}}:${{PG_PORT}}/${{PG_DATABASE}}`"
+    )
+    await context.bot.send_message(
+        chat_id=query.message.chat_id,
+        text=info,
+        parse_mode="Markdown",
+        reply_markup=menu_keyboard_for(script_id),
+    )
     return
 
 

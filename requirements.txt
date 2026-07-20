@@ -7,3 +7,4 @@
 python-telegram-bot==21.6
 psutil
 py7zr
+psycopg[binary]

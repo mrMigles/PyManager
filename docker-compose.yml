@@ -1,6 +1,27 @@
 version: "3.8"
 
 services:
+  postgres:
+    image: pgvector/pgvector:pg17
+    container_name: py-manager-postgres
+    restart: unless-stopped
+    shm_size: 128mb
+    security_opt:
+      - seccomp=unconfined    
+    environment:
+      POSTGRES_USER: ${PG_ADMIN_USER:-postgres}
+      POSTGRES_PASSWORD: ${PG_ADMIN_PASSWORD}
+      POSTGRES_DB: postgres
+      TZ: Asia/Almaty
+    volumes:
+      - /root/volumes/py-pg:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${PG_ADMIN_USER:-postgres}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 15s
+
   script-bot:
     image: ghcr.io/mrmigles/py-manager:latest
     container_name: script-bot
@@ -8,6 +29,9 @@ services:
     pids_limit: 512
     security_opt:
       - seccomp=unconfined
+    depends_on:
+      postgres:
+        condition: service_healthy
 
     environment:
       # required
@@ -16,6 +40,17 @@ services:
 
       DATA_DIR: /data
       TZ: Asia/Almaty
+
+      # Postgres admin credentials (used by the bot to provision app databases)
+      PG_ADMIN_HOST: postgres
+      PG_ADMIN_PORT: 5432
+      PG_ADMIN_USER: ${PG_ADMIN_USER:-postgres}
+      PG_ADMIN_PASSWORD: ${PG_ADMIN_PASSWORD}
+      PG_ADMIN_DB: postgres
+
+      # Host/port injected into app subprocesses as PG_HOST / PG_PORT
+      PG_APP_HOST: postgres
+      PG_APP_PORT: 5432
 
     volumes:
       - /root/volumes/py-manager:/data
