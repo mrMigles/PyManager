@@ -40,6 +40,7 @@ from datetime import datetime
 import pgdb
 
 from telegram import Update, InlineKeyboardMarkup, InlineKeyboardButton
+from telegram.error import BadRequest
 from telegram.ext import (
   Application,
   CommandHandler,
@@ -1616,6 +1617,16 @@ def main_menu_keyboard() -> InlineKeyboardMarkup:
   return InlineKeyboardMarkup(buttons)
 
 
+def log_view_keyboard(script_id: str) -> InlineKeyboardMarkup:
+  buttons = [
+    [
+      InlineKeyboardButton("🔄 Refresh", callback_data=f"logsref:{script_id}"),
+      InlineKeyboardButton("⬇️ Download", callback_data=f"logsdl:{script_id}"),
+    ],
+  ]
+  return InlineKeyboardMarkup(buttons)
+
+
 def script_menu_keyboard(script_id: str) -> InlineKeyboardMarkup:
   # Menu for legacy single-file (.py) scripts - kept exactly as before (full BWC).
   script = script_mgr.get_script(script_id)
@@ -2259,7 +2270,10 @@ async def cmd_logs(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     return
   text = script_mgr.read_log_tail(script_id, lines=LOG_TAIL_LINES)
   ts = datetime.now().strftime("%H:%M:%S")
-  await update.message.reply_text(f"📜 [{ts}] Logs for {script_id} (last {LOG_TAIL_LINES} lines):\n{text}")
+  await update.message.reply_text(
+      safe_trim_text(f"📜 [{ts}] Logs for {script_id} (last {LOG_TAIL_LINES} lines):\n{text}"),
+      reply_markup=log_view_keyboard(script_id),
+  )
 
 
 async def cmd_env(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -2642,7 +2656,40 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     ts = datetime.now().strftime("%H:%M:%S")
     await context.bot.send_message(
         chat_id=query.message.chat_id,
-        text=f"📜 [{ts}] Logs for {script_id} (last {LOG_TAIL_LINES} lines):\n{text}",
+        text=safe_trim_text(f"📜 [{ts}] Logs for {script_id} (last {LOG_TAIL_LINES} lines):\n{text}"),
+        reply_markup=log_view_keyboard(script_id),
+    )
+    return
+
+  if data.startswith("logsref:"):
+    script_id = data.split(":", 1)[1]
+    if not script_mgr.get_script(script_id):
+      await query.edit_message_text("❌ Script not found.")
+      return
+    text = script_mgr.read_log_tail(script_id, lines=LOG_TAIL_LINES)
+    ts = datetime.now().strftime("%H:%M:%S")
+    new_text = safe_trim_text(f"📜 [{ts}] Logs for {script_id} (last {LOG_TAIL_LINES} lines):\n{text}")
+    try:
+      await query.edit_message_text(new_text, reply_markup=log_view_keyboard(script_id))
+    except BadRequest as e:
+      if "Message is not modified" not in str(e):
+        raise
+    return
+
+  if data.startswith("logsdl:"):
+    script_id = data.split(":", 1)[1]
+    if not script_mgr.get_script(script_id):
+      await query.edit_message_text("❌ Script not found.")
+      return
+    log_file = script_mgr.log_path(script_id)
+    if not log_file.exists() or log_file.stat().st_size == 0:
+      await context.bot.send_message(chat_id=query.message.chat_id, text=f"❌ No logs yet for {script_id}.")
+      return
+    await context.bot.send_document(
+        chat_id=query.message.chat_id,
+        document=log_file,
+        filename=f"{script_id}.log",
+        caption=f"📜 Full log for {script_id}",
     )
     return
 
