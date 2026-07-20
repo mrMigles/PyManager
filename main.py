@@ -1112,9 +1112,9 @@ class ScriptManager:
 
     log_file = self.log_path(script_id)
     log_file.parent.mkdir(parents=True, exist_ok=True)
-    trim_file_to_tail(log_file)
-    with log_file.open("ab") as f:
-      f.write(b"\n=== START ===\n")
+    # Start with a clean slate on every (re)start so old runs don't clutter the log.
+    with log_file.open("wb") as f:
+      f.write(b"=== START ===\n")
 
     # Keep handle open while process runs (important!)
     h = log_file.open("ab")
