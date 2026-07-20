@@ -750,6 +750,7 @@ class ScriptManager:
       kind: str = "script",
       app_type: Optional[str] = None,
       git: Optional[Dict[str, Any]] = None,
+      entry_point: Optional[str] = None,
   ) -> None:
     script = self.get_script(script_id)
     if not script:
@@ -764,6 +765,8 @@ class ScriptManager:
       entry["app_type"] = app_type
     if git is not None:
       entry["git"] = git
+    if entry_point is not None:
+      entry["entry"] = entry_point
     versions.insert(0, entry)
 
     # Trim versions list and delete old files
@@ -833,6 +836,7 @@ class ScriptManager:
           kind="app",
           app_type=script.get("type"),
           git=script.get("git"),
+          entry_point=script.get("entry"),
       )
       logger.info("Snapshot app version for %s -> %s", script_id, version_file.name)
     except Exception:
@@ -865,11 +869,19 @@ class ScriptManager:
     logger.info("Script %s saved from text", script_id)
     return script_id
 
-  def upsert_script_from_file(self, original_name: str, content_path: Path) -> str:
-    stem = Path(original_name).stem
-    script_id = stem.strip().replace(" ", "_")
-    if not script_id:
-      script_id = f"script_{len(self.meta.get('scripts', {})) + 1}"
+  def upsert_script_from_file(
+      self,
+      original_name: str,
+      content_path: Path,
+      override_id: Optional[str] = None,
+  ) -> str:
+    if override_id:
+      script_id = override_id
+    else:
+      stem = Path(original_name).stem
+      script_id = stem.strip().replace(" ", "_")
+      if not script_id:
+        script_id = f"script_{len(self.meta.get('scripts', {})) + 1}"
 
     # Snapshot the current state before overwriting, then clean up old-type artifacts.
     existing = self.get_script(script_id)
@@ -1144,7 +1156,7 @@ class ScriptManager:
       fp = str(v.get("file", "")).strip()
       if ts and fp:
         entry: Dict[str, Any] = {"ts": ts, "file": fp}
-        for extra_key in ("kind", "app_type", "git"):
+        for extra_key in ("kind", "app_type", "git", "entry"):
           if extra_key in v:
             entry[extra_key] = v[extra_key]
         out.append(entry)
@@ -1313,7 +1325,14 @@ class ScriptManager:
           shutil.rmtree(tmp_extract, ignore_errors=True)
 
       py_files = discover_python_files(dest_root)
-      entry, _ = pick_entry_from_candidates(py_files)
+      entry, ambiguous = pick_entry_from_candidates(py_files)
+      # If the snapshotted version recorded a confirmed entry point (set when the
+      # owner chose from an ambiguous list), honour it instead of re-running
+      # auto-detection — which can return None for multi-file apps and break
+      # subsequent start_script calls.
+      if chosen.get("entry"):
+        entry = chosen["entry"]
+        ambiguous = False
 
       venv_dir = self.app_venv_dir(script_id)
       venv_ok, venv_out = await create_venv(venv_dir)
@@ -1817,6 +1836,18 @@ async def _prepare_git_app(info: Dict[str, Any]) -> Dict[str, Any]:
   app_id = info["app_id"]
   repo_dir = GITREPOS_DIR / app_id
   repo_url = f"https://github.com/{info['owner']}/{info['repo']}.git"
+
+  # When the existing clone points to a *different* remote (e.g. the user
+  # is replacing a GitHub source via "Change Source"), discard it so
+  # git_clone_or_pull performs a fresh clone instead of fetching the wrong
+  # origin.
+  git_config = repo_dir / ".git" / "config"
+  if git_config.exists():
+    try:
+      if repo_url not in git_config.read_text():
+        shutil.rmtree(repo_dir, ignore_errors=True)
+    except Exception:
+      logger.warning("_prepare_git_app: could not read %s — leaving repo_dir as-is", git_config)
 
   ok, out = await git_clone_or_pull(repo_url, info.get("branch"), repo_dir)
   if not ok:
@@ -2734,7 +2765,7 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         outer = stash.get("staging")
         if outer:
           shutil.rmtree(outer, ignore_errors=True)
-        await query.delete()
+        await query.message.delete()
         await present_setup_result(chat_id, context, script_id, result, f"✅ {script_id} converted to archive app.")
 
       elif stash_action == "git":
@@ -2746,7 +2777,7 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         await query.edit_message_text(f"⚙️ Converting {script_id} to GitHub app ...")
         result = await script_mgr.setup_project_app(script_id, staged_root, "git", git_info)
         result["app_id"] = script_id
-        await query.delete()
+        await query.message.delete()
         await present_setup_result(chat_id, context, script_id, result, f"✅ {script_id} converted to GitHub app.")
 
       elif stash_action == "script_text":
@@ -2764,7 +2795,10 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         tmp_conv.write_bytes(file_bytes)
         try:
           await query.edit_message_text(f"⚙️ Converting {script_id} to script ...")
-          full_id = script_mgr.upsert_script_from_file(original_name, tmp_conv)
+          # Pass override_id so the target app keeps its existing id regardless
+          # of what the uploaded filename was (fixes "Change Source" with a
+          # mismatched filename).
+          full_id = script_mgr.upsert_script_from_file(original_name, tmp_conv, override_id=script_id)
         finally:
           tmp_conv.unlink(missing_ok=True)
         await query.edit_message_text(f"✅ {full_id} converted to script.")
