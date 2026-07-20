@@ -28,6 +28,7 @@ import shlex
 import string
 import asyncio
 import logging
+import logging.handlers
 import shutil
 import tarfile
 import zipfile
@@ -97,16 +98,55 @@ GITHUB_REPO_URL_RE = re.compile(
 )
 
 # Logging
+MAX_LOG_SIZE_BYTES = 100 * 1024  # cap bot.log and per-script logs at 100 KB each
+LOG_TRIM_INTERVAL_SECONDS = 60
+
 bot_log_path = DATA_DIR / "bot.log"
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
     handlers=[
       logging.StreamHandler(sys.stdout),
-      logging.FileHandler(str(bot_log_path), encoding="utf-8"),
+      logging.handlers.RotatingFileHandler(
+          str(bot_log_path), maxBytes=MAX_LOG_SIZE_BYTES, backupCount=1, encoding="utf-8"
+      ),
     ],
 )
 logger = logging.getLogger("script-bot")
+
+
+def trim_file_to_tail(path: Path, max_bytes: int = MAX_LOG_SIZE_BYTES) -> None:
+  """Keep only the last `max_bytes` of a file, dropping the oldest content.
+
+  Used for per-script log files, which are written to directly by subprocess
+  stdout/stderr (not via the logging module), so they need their own cap.
+  """
+  try:
+    size = path.stat().st_size
+  except FileNotFoundError:
+    return
+  if size <= max_bytes:
+    return
+  try:
+    with path.open("r+b") as f:
+      f.seek(-max_bytes, os.SEEK_END)
+      f.readline()  # drop partial line so the tail starts cleanly
+      tail = f.read()
+      f.seek(0)
+      f.write(tail)
+      f.truncate()
+  except Exception:
+    logger.exception("Failed to trim log file %s", path)
+
+
+async def trim_script_logs_periodically() -> None:
+  while True:
+    try:
+      for log_file in LOGS_DIR.glob("*.log"):
+        trim_file_to_tail(log_file)
+    except Exception:
+      logger.exception("Log trim sweep failed")
+    await asyncio.sleep(LOG_TRIM_INTERVAL_SECONDS)
 
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 OWNER_ID_ENV = os.getenv("OWNER_ID")
@@ -1032,6 +1072,7 @@ class ScriptManager:
 
     log_file = self.log_path(script_id)
     log_file.parent.mkdir(parents=True, exist_ok=True)
+    trim_file_to_tail(log_file)
     with log_file.open("ab") as f:
       f.write(b"\n=== START ===\n")
 
@@ -2930,6 +2971,7 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
 
 async def on_startup(app: Application) -> None:
   logger.info("Bot startup: install requirements + prepare app venvs + autostart")
+  asyncio.create_task(trim_script_logs_periodically())
   await script_mgr.ensure_requirements_installed()
   await script_mgr.ensure_app_environments()
   await script_mgr.autostart_all()
