@@ -2391,6 +2391,9 @@ async def cmd_monitoring(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     )
     return
 
+  loop = asyncio.get_running_loop()
+  pg_metrics = await loop.run_in_executor(None, pgdb.get_database_observability, running)
+
   lines = ["📈 Monitoring (running scripts):", ""]
   for sid in running:
     p = script_mgr.psutil_procs.get(sid)
@@ -2427,6 +2430,13 @@ async def cmd_monitoring(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
           extra.append(f"NET s/r: {int(nio.bytes_sent/1024)}KB/{int(nio.bytes_recv/1024)}KB")
       except Exception:
         pass
+
+      pg_metric = pg_metrics.get(sid)
+      if pg_metric:
+        size_mb = pg_metric["size_bytes"] / (1024 * 1024)
+        read_rate = pg_metric["read_rows_per_second"]
+        write_rate = pg_metric["write_rows_per_second"]
+        extra.append(f"PG {size_mb:.1f}MB | avg R/W {read_rate:.2f}/{write_rate:.2f} rows/s")
 
       line = (
         f"🟢 {sid} | PID {pid} | up {uptime_s}s | CPU {cpu:.1f}% | MEM {mem:.1f}MB | thr {threads}"

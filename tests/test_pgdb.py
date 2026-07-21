@@ -10,7 +10,7 @@ not set) and every helper short-circuits accordingly.
 import os
 import sys
 from pathlib import Path
-from unittest.mock import MagicMock, patch, call
+from unittest.mock import AsyncMock, MagicMock, patch, call
 
 import pytest
 
@@ -106,6 +106,50 @@ class TestGetAppDatabase:
             "username": "myapp",
             "password": "pw123",
         }
+
+
+# ---------------------------------------------------------------------------
+# get_database_observability
+# ---------------------------------------------------------------------------
+
+class TestDatabaseObservability:
+    def test_empty_when_pg_disabled(self, monkeypatch):
+        monkeypatch.setattr(pgdb_module, "_ADMIN_PASSWORD", None)
+        assert pgdb_module.get_database_observability(["myapp"]) == {}
+
+    def test_maps_size_and_average_row_rates(self, monkeypatch):
+        monkeypatch.setattr(pgdb_module, "_ADMIN_PASSWORD", "secret")
+        cursor = MagicMock()
+        cursor.fetchall.return_value = [
+            ("myapp", 16 * 1024 * 1024, 600, 150, 300),
+        ]
+        conn = MagicMock()
+        conn.execute.return_value = cursor
+        conn.__enter__ = lambda s: s
+        conn.__exit__ = MagicMock(return_value=False)
+        monkeypatch.setattr(pgdb_module, "_admin_conn", lambda **kw: conn)
+
+        result = pgdb_module.get_database_observability(["myapp", "myapp"])
+
+        assert result == {
+            "myapp": {
+                "size_bytes": float(16 * 1024 * 1024),
+                "read_rows_per_second": 2.0,
+                "write_rows_per_second": 0.5,
+            }
+        }
+        params = conn.execute.call_args.args[1]
+        assert "pg_database_size(r.db_name::name)" in conn.execute.call_args.args[0]
+        assert params == (["myapp"],)
+
+    def test_returns_empty_when_query_fails(self, monkeypatch):
+        monkeypatch.setattr(pgdb_module, "_ADMIN_PASSWORD", "secret")
+        monkeypatch.setattr(
+            pgdb_module,
+            "_admin_conn",
+            MagicMock(side_effect=RuntimeError("postgres unavailable")),
+        )
+        assert pgdb_module.get_database_observability(["myapp"]) == {}
 
 
 # ---------------------------------------------------------------------------
@@ -305,3 +349,49 @@ async def test_start_script_no_pg_env_when_disabled(app, script_mgr, fast_venv, 
     script_id = script_mgr.upsert_script_from_text("nopg", "print('hi')")
     msg = await script_mgr.start_script(script_id)
     assert "Started" in msg
+
+
+@pytest.mark.asyncio
+async def test_monitoring_includes_pg_observability(app, script_mgr, monkeypatch):
+    class FakeProcess:
+        pid = 321
+        returncode = None
+
+    class FakePsutilProcess:
+        def cpu_percent(self, interval=None):
+            return 1.5
+
+        def memory_info(self):
+            return type("MemoryInfo", (), {"rss": 32 * 1024 * 1024})()
+
+        def num_threads(self):
+            return 2
+
+        def io_counters(self):
+            raise RuntimeError("not supported")
+
+    monkeypatch.setattr(script_mgr, "list_scripts", lambda: {"myapp": {}})
+    monkeypatch.setattr(script_mgr, "script_running", lambda sid: True)
+    script_mgr.processes["myapp"] = FakeProcess()
+    script_mgr.psutil_procs["myapp"] = FakePsutilProcess()
+    monkeypatch.setattr(app, "is_authorized", lambda update: True)
+    monkeypatch.setattr(app, "psutil", object())
+    monkeypatch.setattr(
+        app.pgdb,
+        "get_database_observability",
+        lambda app_ids: {
+            "myapp": {
+                "size_bytes": 16 * 1024 * 1024,
+                "read_rows_per_second": 2.0,
+                "write_rows_per_second": 0.5,
+            }
+        },
+    )
+    update = type("Update", (), {})()
+    update.message = type("Message", (), {"reply_text": AsyncMock()})()
+
+    await app.cmd_monitoring(update, object())
+
+    message = update.message.reply_text.await_args.args[0]
+    assert "PG 16.0MB" in message
+    assert "avg R/W 2.00/0.50 rows/s" in message

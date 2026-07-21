@@ -29,7 +29,8 @@ Designed for **single-owner** usage (restricted by `OWNER_ID`).
   (scans all `.py` files for apps, same detection logic as before for scripts)
 - **🚀 Autostart**: run selected scripts/apps automatically when the manager starts
 - **⏪ Rollback**: keeps **last 10 versions** per script/app with timestamps, one-click rollback
-- **📈 Monitoring**: `/monitoring` shows CPU/MEM for running scripts/apps (**psutil**)
+- **📈 Monitoring**: `/monitoring` shows CPU/MEM for running scripts/apps (**psutil**), plus
+  PostgreSQL database size and average row read/write rates for provisioned app databases
 
 ### Isolation model
 - Each **app** (from an archive or a GitHub repo) gets its own Python virtualenv under
@@ -108,7 +109,7 @@ docker compose down
 - `/run <id>` — start script/app
 - `/stop <id>` — stop script/app
 - `/logs <id>` — show last log lines
-- `/monitoring` — CPU/MEM for running scripts/apps (install psutil if needed)
+- `/monitoring` — CPU/MEM for running scripts/apps and PG size/average row I/O
 - `/pip <args>` — install packages (shared `requirements.txt` for scripts, per-app venv + `requirements.txt` for apps)
 
 ### Importing an app

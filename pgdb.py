@@ -23,7 +23,7 @@ import logging
 import os
 import re
 import secrets
-from typing import Dict, Optional
+from typing import Dict, Iterable, Optional
 
 # psycopg is an optional runtime dependency.  The import is attempted at module
 # load time so tests can monkeypatch pgdb._psycopg / pgdb._psycopg_sql without
@@ -130,6 +130,48 @@ def get_app_database(app_id: str) -> Optional[Dict[str, str]]:
     except Exception:
         logger.exception("Failed to query registry for app %s", app_id)
         return None
+
+
+def get_database_observability(app_ids: Iterable[str]) -> Dict[str, Dict[str, float]]:
+    """Return size and average row read/write rates for provisioned app DBs.
+
+    Rates are calculated from ``pg_stat_database`` counters since their last
+    reset, falling back to the PostgreSQL server start time.  Missing registry
+    data or an unavailable PostgreSQL server produces an empty result so the
+    main process observability view remains usable.
+    """
+    requested_ids = list(dict.fromkeys(app_ids))
+    if not pg_enabled() or not requested_ids:
+        return {}
+
+    try:
+        with _admin_conn() as conn:
+            rows = conn.execute(
+                f"SELECT r.app_id, pg_database_size(r.db_name::name),"
+                " COALESCE(s.tup_returned, 0),"
+                " COALESCE(s.tup_inserted, 0)"
+                "   + COALESCE(s.tup_updated, 0)"
+                "   + COALESCE(s.tup_deleted, 0),"
+                " GREATEST(EXTRACT(EPOCH FROM (clock_timestamp() -"
+                "   COALESCE(s.stats_reset, pg_postmaster_start_time()))), 1)"
+                f" FROM {_REGISTRY_TABLE} AS r"
+                " LEFT JOIN pg_stat_database AS s ON s.datname = r.db_name"
+                " WHERE r.app_id = ANY(%s::text[])",
+                (requested_ids,),
+            ).fetchall()
+    except Exception:
+        logger.exception("Failed to collect PostgreSQL observability metrics")
+        return {}
+
+    metrics: Dict[str, Dict[str, float]] = {}
+    for app_id, size_bytes, rows_read, rows_written, elapsed_seconds in rows:
+        elapsed = max(float(elapsed_seconds), 1.0)
+        metrics[app_id] = {
+            "size_bytes": float(size_bytes),
+            "read_rows_per_second": float(rows_read) / elapsed,
+            "write_rows_per_second": float(rows_written) / elapsed,
+        }
+    return metrics
 
 
 def provision_database(app_id: str) -> Dict[str, str]:
